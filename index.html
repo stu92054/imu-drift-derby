@@ -202,7 +202,7 @@
     <input type="checkbox" id="zuptChk" style="width:22px;height:22px;accent-color:var(--accent)">
     <span class="val" id="zuptState" style="min-width:60px">OFF</span>
   </div>
-  <div class="subtitle" style="margin:6px 0 0">準靜置(|a|≈1g 且陀螺安靜)持續 0.3s → 速度歸零 + 線上更新加速計零偏。可在量測中切換,對比開關前後的漂移行為。</div>
+  <div class="subtitle" style="margin:6px 0 0">儀器層靜止 0.3s → 回溯扣除靜止期間的幻影位移 + 速度歸零 + 線上更新零偏。可在量測中切換,對比開關前後的漂移行為。</div>
   <div class="slider-row" style="margin-top:12px">
     <label>自算線性加速度</label>
     <input type="checkbox" id="ownAccChk" style="width:22px;height:22px;accent-color:var(--accent)">
@@ -269,8 +269,8 @@ $('tau').addEventListener('input', e => {
 
 // ZUPT(零速修正)開關
 let zuptEnabled = false;
-let zuptHold = 0;          // 準靜置連續樣本數
 let stillHold = 0;         // 儀器層靜止偵測連續樣本數(陀螺+|a|,不依賴導航估計)
+let stillStartT = 0;       // 本次靜止開始的時間戳(ZUPT 回溯修正用)
 let zuptActiveNow = false; // 目前是否觸發中(UI 顯示用)
 $('zuptChk').addEventListener('change', e => { zuptEnabled = e.target.checked; });
 
@@ -456,7 +456,7 @@ function onMotion(ev) {
   const agMag = Math.hypot(ag.x||0, ag.y||0, ag.z||0);
   const gyroDps = Math.hypot(wx, wy, wz) * 180/Math.PI;
   const stillNow = gyroDps < 3 && agMag > 1e-3 && Math.abs(agMag - g0) < 0.6;
-  if (stillNow) stillHold++; else stillHold = 0;
+  if (stillNow) { stillHold++; if (stillHold === 1) stillStartT = now; } else stillHold = 0;
   const isStill = stillHold >= 20;   // 持續 ~0.2–0.3 s 才算靜止
   let corrGain = 0;                  // 本樣本實際使用的重力修正增益(log 用)
 
@@ -534,13 +534,21 @@ function onMotion(ev) {
   vel.x = nvx; vel.y = nvy; vel.z = nvz;
 
   /* ===================== ZUPT 零速修正(可選)=====================
-     準靜置(|a|≈1g 且陀螺安靜)持續 ~0.3s → 此刻真實速度應為 0:
-     1) 把積分速度強制歸零(殺掉速度誤差,位置誤差從 t² 降為分段線性)。
-     2) 靜止時 body 加速度殘差就是零偏估計誤差,用 EMA 緩慢吸收進零偏。
+     儀器層確認靜止(isStill,~0.3s)→ 此刻真實速度應為 0:
+     1) 回溯修正:從「靜止開始」到現在,手機物理上沒動,這段時間用幽靈速度
+        積出來的位移是幻影,可以精確扣掉(不是猜測——儀器層靜止是硬證據)。
+     2) 把積分速度強制歸零(殺掉速度誤差,位置誤差從 t² 降為分段線性)。
+     3) 靜止時 body 加速度殘差就是零偏估計誤差,用 EMA 緩慢吸收進零偏。
      注意:|a|≈g 是必要非充分條件——等速運動也滿足,會被誤判為靜止。 */
-  if (zuptEnabled && quasiStatic) zuptHold++; else zuptHold = 0;
-  zuptActiveNow = zuptEnabled && zuptHold >= 20;
-  if (zuptActiveNow) {
+  if (zuptEnabled && isStill) {
+    if (!zuptActiveNow) {
+      // 首次觸發:扣除靜止期間累積的幻影位移(視窗上限 3s 防呆)
+      const dtStill = Math.min((now - stillStartT) / 1000, 3);
+      pos.x -= vel.x * dtStill;
+      pos.y -= vel.y * dtStill;
+      pos.z -= vel.z * dtStill;
+    }
+    zuptActiveNow = true;
     vel.x = 0; vel.y = 0; vel.z = 0;
     // 線上零偏學習(body 系,寫入目前使用中的來源)
     if (ownAcc && ag.x != null) {
@@ -552,6 +560,8 @@ function onMotion(ev) {
       bias.ay += 0.02 * aBody.y;
       bias.az += 0.02 * aBody.z;
     }
+  } else {
+    zuptActiveNow = false;
   }
 
   elapsed = (now - runStartT) / 1000;
@@ -684,7 +694,7 @@ function resetSession() {
   elapsed = 0; peakDisp = 0;
   log = []; traj = []; errSeries = [];
   staticBadCount = 0; sensorWarned = false;
-  zuptHold = 0; zuptActiveNow = false; stillHold = 0;
+  zuptActiveNow = false; stillHold = 0; stillStartT = 0;
   lastABody = { x:0, y:0, z:0 }; lastAWorld = { x:0, y:0, z:0 };
 }
 
