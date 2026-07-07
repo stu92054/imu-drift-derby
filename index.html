@@ -196,6 +196,12 @@
     <span class="val" id="alphaVal">0.980</span>
   </div>
   <div class="subtitle" style="margin:6px 0 0">α 越高越信任陀螺積分;(1−α) 為加速計重力修正權重。</div>
+  <div class="slider-row" style="margin-top:12px">
+    <label>ZUPT 零速修正</label>
+    <input type="checkbox" id="zuptChk" style="width:22px;height:22px;accent-color:var(--accent)">
+    <span class="val" id="zuptState" style="min-width:60px">OFF</span>
+  </div>
+  <div class="subtitle" style="margin:6px 0 0">準靜置(|a|≈1g 且陀螺安靜)持續 0.3s → 速度歸零 + 線上更新加速計零偏。可在量測中切換,對比開關前後的漂移行為。</div>
 </div>
 
 <!-- 部署說明 -->
@@ -253,6 +259,12 @@ $('alpha').addEventListener('input', e => {
   alpha = parseFloat(e.target.value);
   $('alphaVal').textContent = alpha.toFixed(3);
 });
+
+// ZUPT(零速修正)開關
+let zuptEnabled = false;
+let zuptHold = 0;          // 準靜置連續樣本數
+let zuptActiveNow = false; // 目前是否觸發中(UI 顯示用)
+$('zuptChk').addEventListener('change', e => { zuptEnabled = e.target.checked; });
 
 // ---- 校正資料(零偏)----
 const CALIB_SECONDS = 5;
@@ -473,6 +485,20 @@ function onMotion(ev) {
   pos.z += (vel.z + nvz) * 0.5 * dt;
   vel.x = nvx; vel.y = nvy; vel.z = nvz;
 
+  /* ===================== ZUPT 零速修正(可選)=====================
+     準靜置(|a|≈1g 且陀螺安靜)持續 ~0.3s → 此刻真實速度應為 0:
+     1) 把積分速度強制歸零(殺掉速度誤差,位置誤差從 t² 降為分段線性)。
+     2) 靜止時 body 加速度殘差就是零偏估計誤差,用 EMA 緩慢吸收進零偏。
+     注意:|a|≈g 是必要非充分條件——等速運動也滿足,會被誤判為靜止。 */
+  if (zuptEnabled && quasiStatic) zuptHold++; else zuptHold = 0;
+  zuptActiveNow = zuptEnabled && zuptHold >= 20;
+  if (zuptActiveNow) {
+    vel.x = 0; vel.y = 0; vel.z = 0;
+    bias.ax += 0.02 * aBody.x;   // 線上零偏學習(body 系)
+    bias.ay += 0.02 * aBody.y;
+    bias.az += 0.02 * aBody.z;
+  }
+
   elapsed = (now - runStartT) / 1000;
 
   // --- 記錄 CSV 樣本 ---
@@ -482,7 +508,8 @@ function onMotion(ev) {
     (gxDeg-bias.gx).toFixed(4), (gyDeg-bias.gy).toFixed(4), (gzDeg-bias.gz).toFixed(4),
     pos.x.toFixed(5), pos.y.toFixed(5), pos.z.toFixed(5),
     Math.hypot(vel.x, vel.y, vel.z).toFixed(5),
-    (att.roll*180/Math.PI).toFixed(3), (att.pitch*180/Math.PI).toFixed(3), (att.yaw*180/Math.PI).toFixed(3)
+    (att.roll*180/Math.PI).toFixed(3), (att.pitch*180/Math.PI).toFixed(3), (att.yaw*180/Math.PI).toFixed(3),
+    zuptActiveNow ? 1 : 0
   ]);
 
   // --- 軌跡 / 誤差序列(降採樣以免爆記憶體)---
@@ -577,6 +604,7 @@ function resetSession() {
   elapsed = 0; peakDisp = 0;
   log = []; traj = []; errSeries = [];
   staticBadCount = 0; sensorWarned = false;
+  zuptHold = 0; zuptActiveNow = false;
   lastABody = { x:0, y:0, z:0 }; lastAWorld = { x:0, y:0, z:0 };
 }
 
@@ -609,7 +637,8 @@ function exportCSV() {
     'gx_dps','gy_dps','gz_dps',
     'pos_x_m','pos_y_m','pos_z_m',
     'speed_ms',
-    'roll_deg','pitch_deg','yaw_deg'
+    'roll_deg','pitch_deg','yaw_deg',
+    'zupt'
   ].join(',');
   const body = log.map(r => r.join(',')).join('\n');
   // 檔頭附上 metadata 註解(以 # 開頭,分析時可略過)
@@ -787,6 +816,7 @@ function updatePanel() {
     $('sElapsed').textContent = elapsed.toFixed(1);
     timerVal.textContent = elapsed.toFixed(1);
   }
+  $('zuptState').textContent = zuptEnabled ? (zuptActiveNow ? 'ON·觸發中' : 'ON') : 'OFF';
   $('sAccB').textContent = Math.hypot(lastABody.x, lastABody.y, lastABody.z).toFixed(2);
   $('sAccW').textContent = Math.hypot(lastAWorld.x, lastAWorld.y, lastAWorld.z).toFixed(2);
   $('sDisp').textContent = Math.hypot(pos.x, pos.y).toFixed(3);
