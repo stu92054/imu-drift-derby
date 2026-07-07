@@ -269,6 +269,7 @@ $('tau').addEventListener('input', e => {
 // ZUPT(零速修正)開關
 let zuptEnabled = false;
 let zuptHold = 0;          // 準靜置連續樣本數
+let stillHold = 0;         // 儀器層靜止偵測連續樣本數(陀螺+|a|,不依賴導航估計)
 let zuptActiveNow = false; // 目前是否觸發中(UI 顯示用)
 $('zuptChk').addEventListener('change', e => { zuptEnabled = e.target.checked; });
 
@@ -448,8 +449,16 @@ function onMotion(ev) {
   }
   q = qNorm(qMul(q, dq));   // 陀螺預測(body 系右乘)
 
-  // 加速計重力修正(只在加速度大小接近 1g 時採信)
+  // --- 儀器層靜止偵測 ---
+  // 只看原始陀螺與 |a|,絕不依賴我們自己的導航估計——
+  // 否則姿態一歪、假加速度觸發「運動中」判定,修正被鎖死,錯誤永遠修不回來(自鎖)。
   const agMag = Math.hypot(ag.x||0, ag.y||0, ag.z||0);
+  const gyroDps = Math.hypot(wx, wy, wz) * 180/Math.PI;
+  const stillNow = gyroDps < 3 && agMag > 1e-3 && Math.abs(agMag - g0) < 0.6;
+  if (stillNow) stillHold++; else stillHold = 0;
+  const isStill = stillHold >= 20;   // 持續 ~0.2–0.3 s 才算靜止
+
+  // 加速計重力修正(只在加速度大小接近 1g 時採信)
   if (agMag > 1e-3 && Math.abs(agMag - g0) < 2.0) {
     // 量測的重力方向(body 系,指向上方=遠離地心的反向;normalize)
     const mUp = { x:(ag.x||0)/agMag, y:(ag.y||0)/agMag, z:(ag.z||0)/agMag };
@@ -459,12 +468,17 @@ function onMotion(ev) {
     const ex = mUp.y*pUp.z - mUp.z*pUp.y;
     const ey = mUp.z*pUp.x - mUp.x*pUp.z;
     const ez = mUp.x*pUp.y - mUp.y*pUp.x;
-    // 增益 = dt/τ(時間常數化,與取樣率無關)。
-    // 運動閘控:自估線性加速度大時(正在推手機)增益再降 10 倍,
-    // 否則持續加速度會被吸進重力方向 → 等效高通 → 減速時軌跡走回頭路。
-    // 注意水平加速度幾乎不改 |ag|(正交於重力),靠大小閘擋不住,必須靠這裡。
-    let gain = dt / tau;
-    if (Math.hypot(lastAWorld.x, lastAWorld.y, lastAWorld.z) > 0.4) gain *= 0.1;
+    // 兩段式增益:
+    // 靜止(儀器層確認)→ 快速重新錨定重力(τ≈2s),把運動期間漏掉的姿態誤差修回來;
+    // 運動中 → 慢 τ,且自估線性加速度大時再降 10 倍,避免持續加速度被吸進重力
+    //(等效高通 → 減速時走回頭路)。水平加速度幾乎不改 |ag|,大小閘擋不住,必須靠這裡。
+    let gain;
+    if (isStill) {
+      gain = dt / 2;
+    } else {
+      gain = dt / tau;
+      if (Math.hypot(lastAWorld.x, lastAWorld.y, lastAWorld.z) > 0.4) gain *= 0.1;
+    }
     gain = Math.min(gain, 0.05);
     // 把小旋轉誤差當作四元數修正右乘進去
     const corr = qNorm({ w:1, x:ex*gain, y:ey*gain, z:ez*gain });
@@ -498,9 +512,8 @@ function onMotion(ev) {
   // 準靜置 = 陀螺幾乎不轉 + 總加速度接近 1g。此時線性加速度理應 ≈ 0;
   // 若殘差持續偏大,代表劇烈晃動讓加速計飽和或污染了 OS 的重力低通估計,
   // 這個殘差會被二次積分放大成假位移 → 提示使用者重新校正。
-  const gyroDps = Math.hypot(wx, wy, wz) * 180/Math.PI;
   const aWorldMag = Math.hypot(aWorld.x, aWorld.y, aWorld.z);
-  const quasiStatic = gyroDps < 3 && Math.abs(agMag - g0) < 0.6;
+  const quasiStatic = isStill;   // 沿用儀器層靜止偵測(含 hold 時間)
   if (quasiStatic && aWorldMag > 0.35) staticBadCount++; else staticBadCount = 0;
   if (staticBadCount > 100 && !sensorWarned) {   // 約 1.5~2 秒
     sensorWarned = true;
@@ -661,7 +674,7 @@ function resetSession() {
   elapsed = 0; peakDisp = 0;
   log = []; traj = []; errSeries = [];
   staticBadCount = 0; sensorWarned = false;
-  zuptHold = 0; zuptActiveNow = false;
+  zuptHold = 0; zuptActiveNow = false; stillHold = 0;
   lastABody = { x:0, y:0, z:0 }; lastAWorld = { x:0, y:0, z:0 };
 }
 
