@@ -134,6 +134,7 @@
   <button class="btn" id="btnStart" disabled>② 開始量測</button>
   <button class="btn danger" id="btnStop" disabled>③ 停止</button>
   <button class="btn secondary" id="btnExport" disabled>④ 匯出 CSV</button>
+  <button class="btn secondary" id="btnShare" disabled>⑤ 分享 Log(傳給電腦分析)</button>
 </div>
 
 <!-- 即時數字面板 -->
@@ -251,7 +252,7 @@ const $ = id => document.getElementById(id);
 const statusEl = $('status');
 const badge = $('stateBadge');
 const timerBar = $('timerBar'), timerVal = $('timerVal'), timerLbl = $('timerLbl');
-const btnCalib = $('btnCalib'), btnStart = $('btnStart'), btnStop = $('btnStop'), btnExport = $('btnExport');
+const btnCalib = $('btnCalib'), btnStart = $('btnStart'), btnStop = $('btnStop'), btnExport = $('btnExport'), btnShare = $('btnShare');
 const hzView = $('hzView');
 const calibCard = $('calibCard');
 
@@ -457,6 +458,7 @@ function onMotion(ev) {
   const stillNow = gyroDps < 3 && agMag > 1e-3 && Math.abs(agMag - g0) < 0.6;
   if (stillNow) stillHold++; else stillHold = 0;
   const isStill = stillHold >= 20;   // 持續 ~0.2–0.3 s 才算靜止
+  let corrGain = 0;                  // 本樣本實際使用的重力修正增益(log 用)
 
   // 加速計重力修正(只在加速度大小接近 1g 時採信)
   if (agMag > 1e-3 && Math.abs(agMag - g0) < 2.0) {
@@ -480,6 +482,7 @@ function onMotion(ev) {
       if (Math.hypot(lastAWorld.x, lastAWorld.y, lastAWorld.z) > 0.4) gain *= 0.1;
     }
     gain = Math.min(gain, 0.05);
+    corrGain = gain;
     // 把小旋轉誤差當作四元數修正右乘進去
     const corr = qNorm({ w:1, x:ex*gain, y:ey*gain, z:ez*gain });
     q = qNorm(qMul(q, corr));
@@ -553,15 +556,22 @@ function onMotion(ev) {
 
   elapsed = (now - runStartT) / 1000;
 
-  // --- 記錄 CSV 樣本 ---
+  // --- 記錄診斷 log 樣本(三層:原始輸入 / 濾波器內部 / 積分輸出)---
   log.push([
     elapsed.toFixed(4),
-    aBody.x.toFixed(5), aBody.y.toFixed(5), aBody.z.toFixed(5),
-    (gxDeg-bias.gx).toFixed(4), (gyDeg-bias.gy).toFixed(4), (gzDeg-bias.gz).toFixed(4),
+    (dt*1000).toFixed(2),                                        // 實際 dt (ms)
+    (ownAcc && ag.x != null) ? 1 : 0,                            // 加速度來源
+    isStill ? 1 : 0, zuptActiveNow ? 1 : 0,
+    corrGain.toExponential(2),                                   // 本樣本重力修正增益
+    ax.toFixed(5), ay.toFixed(5), az.toFixed(5),                 // OS linear accel(原始)
+    (ag.x||0).toFixed(5), (ag.y||0).toFixed(5), (ag.z||0).toFixed(5), // includingGravity(原始)
+    gxDeg.toFixed(4), gyDeg.toFixed(4), gzDeg.toFixed(4),        // 陀螺(原始 deg/s)
+    aBody.x.toFixed(5), aBody.y.toFixed(5), aBody.z.toFixed(5),  // 實際採用的 body 線性加速度
+    aWorld.x.toFixed(5), aWorld.y.toFixed(5), aWorld.z.toFixed(5),
+    vel.x.toFixed(5), vel.y.toFixed(5), vel.z.toFixed(5),
     pos.x.toFixed(5), pos.y.toFixed(5), pos.z.toFixed(5),
-    Math.hypot(vel.x, vel.y, vel.z).toFixed(5),
-    (att.roll*180/Math.PI).toFixed(3), (att.pitch*180/Math.PI).toFixed(3), (att.yaw*180/Math.PI).toFixed(3),
-    zuptActiveNow ? 1 : 0
+    q.w.toFixed(6), q.x.toFixed(6), q.y.toFixed(6), q.z.toFixed(6),
+    (att.roll*180/Math.PI).toFixed(3), (att.pitch*180/Math.PI).toFixed(3), (att.yaw*180/Math.PI).toFixed(3)
   ]);
 
   // --- 軌跡 / 誤差序列(降採樣以免爆記憶體)---
@@ -699,16 +709,18 @@ function deviceTag() {
   return model.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 40) || 'device';
 }
 
-function exportCSV() {
-  if (!log.length) { setStatus('沒有資料可匯出。', 'err'); return; }
+function buildCSV() {
   const header = [
-    'timestamp_s',
-    'ax_ms2','ay_ms2','az_ms2',
+    't_s','dt_ms','src_own','still','zupt','corr_gain',
+    'ax_os','ay_os','az_os',
+    'agx','agy','agz',
     'gx_dps','gy_dps','gz_dps',
-    'pos_x_m','pos_y_m','pos_z_m',
-    'speed_ms',
-    'roll_deg','pitch_deg','yaw_deg',
-    'zupt'
+    'abx','aby','abz',
+    'awx','awy','awz',
+    'vx','vy','vz',
+    'px','py','pz',
+    'qw','qx','qy','qz',
+    'roll_deg','pitch_deg','yaw_deg'
   ].join(',');
   const body = log.map(r => r.join(',')).join('\n');
   // 檔頭附上 metadata 註解(以 # 開頭,分析時可略過)
@@ -723,18 +735,41 @@ function exportCSV() {
     `# mean_hz=${dtSmoothed ? (1/dtSmoothed).toFixed(1) : 'NA'}`
   ].join('\n');
   const csv = meta + '\n' + header + '\n' + body + '\n';
-
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
   // 檔名:imu_<型號>_<ISO時間>.csv(冒號在檔名不合法,替換掉)
   const isoSafe = (sessionStartISO || new Date().toISOString()).replace(/[:.]/g, '-');
   const fname = `imu_${deviceTag()}_${isoSafe}.csv`;
+  return { csv, fname };
+}
+
+function exportCSV() {
+  if (!log.length) { setStatus('沒有資料可匯出。', 'err'); return; }
+  const { csv, fname } = buildCSV();
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url; a.download = fname;
   document.body.appendChild(a); a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 2000);
   setStatus('已匯出:' + fname, 'ok');
+}
+
+// Web Share API:手機直接把 log 檔分享出去(LINE / AirDrop / 郵件)
+async function shareCSV() {
+  if (!log.length) { setStatus('沒有資料可分享。', 'err'); return; }
+  const { csv, fname } = buildCSV();
+  const file = new File([csv], fname, { type: 'text/csv' });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: fname });
+      setStatus('已分享:' + fname, 'ok');
+    } catch (e) {
+      if (e.name !== 'AbortError') setStatus('分享失敗:' + e.message + ',改用「匯出 CSV」下載。', 'err');
+    }
+  } else {
+    setStatus('此瀏覽器不支援檔案分享,改用「匯出 CSV」下載後手動傳送。', 'err');
+    exportCSV();
+  }
 }
 
 /* =========================================================================
@@ -946,9 +981,8 @@ function setState(s) {
   btnCalib.disabled  = (s === State.CALIB || s === State.RUN);
   btnStart.disabled  = !(s === State.READY || s === State.STOPPED);
   btnStop.disabled   = (s !== State.RUN);
-  btnExport.disabled = !(s === State.STOPPED || s === State.RUN) || log.length === 0;
-  // 量測中也允許隨時匯出目前累積
-  if (s === State.RUN) btnExport.disabled = true;
+  btnExport.disabled = !(s === State.STOPPED) || log.length === 0;
+  btnShare.disabled = btnExport.disabled;
 }
 
 let baseStatus = '';
@@ -964,8 +998,9 @@ function appendStatusHint(hint) {
 // 綁定按鈕
 btnCalib.addEventListener('click', startCalibration);
 btnStart.addEventListener('click', startRun);
-btnStop.addEventListener('click', () => { stopRun(); btnExport.disabled = log.length === 0; });
+btnStop.addEventListener('click', () => { stopRun(); btnExport.disabled = log.length === 0; btnShare.disabled = btnExport.disabled; });
 btnExport.addEventListener('click', exportCSV);
+btnShare.addEventListener('click', shareCSV);
 
 // 初始
 setState(State.IDLE);
