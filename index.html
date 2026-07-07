@@ -202,6 +202,12 @@
     <span class="val" id="zuptState" style="min-width:60px">OFF</span>
   </div>
   <div class="subtitle" style="margin:6px 0 0">準靜置(|a|≈1g 且陀螺安靜)持續 0.3s → 速度歸零 + 線上更新加速計零偏。可在量測中切換,對比開關前後的漂移行為。</div>
+  <div class="slider-row" style="margin-top:12px">
+    <label>自算線性加速度</label>
+    <input type="checkbox" id="ownAccChk" style="width:22px;height:22px;accent-color:var(--accent)">
+    <span class="val" id="ownAccState" style="min-width:60px">OS</span>
+  </div>
+  <div class="subtitle" style="margin:6px 0 0">OFF = 用 OS 的 acceleration(部分廠商做高通/鉗位,持續加速度被吃掉 → 淨位移低估)。ON = includingGravity − 本頁姿態估計的重力(陀螺錨定,保留低頻;代價是姿態誤差 1° ≈ 0.17 m/s² 假加速度)。</div>
 </div>
 
 <!-- 部署說明 -->
@@ -266,10 +272,16 @@ let zuptHold = 0;          // 準靜置連續樣本數
 let zuptActiveNow = false; // 目前是否觸發中(UI 顯示用)
 $('zuptChk').addEventListener('change', e => { zuptEnabled = e.target.checked; });
 
+// 加速度來源:false = OS 的 acceleration;true = 自算 (includingGravity − 姿態估計重力)
+let ownAcc = false;
+let biasOwn = { x:0, y:0, z:0 };   // 自算模式的零偏(ZUPT 線上學習用)
+let g0 = 9.81;                     // 校正期間實測的本地重力大小
+$('ownAccChk').addEventListener('change', e => { ownAcc = e.target.checked; });
+
 // ---- 校正資料(零偏)----
 const CALIB_SECONDS = 5;
 let calibStartT = 0;
-let calibSum = { ax:0, ay:0, az:0, gx:0, gy:0, gz:0, n:0 };
+let calibSum = { ax:0, ay:0, az:0, gx:0, gy:0, gz:0, agx:0, agy:0, agz:0, n:0 };
 let bias = { ax:0, ay:0, az:0, gx:0, gy:0, gz:0 };  // 加速計/陀螺零偏(全程扣除)
 
 // ---- 姿態四元數(body→world),初始化為單位 ----
@@ -400,6 +412,7 @@ function onMotion(ev) {
   if (state === State.CALIB) {
     calibSum.ax += ax; calibSum.ay += ay; calibSum.az += az;
     calibSum.gx += gxDeg; calibSum.gy += gyDeg; calibSum.gz += gzDeg;
+    calibSum.agx += (ag.x||0); calibSum.agy += (ag.y||0); calibSum.agz += (ag.z||0);
     calibSum.n++;
     const t = (now - calibStartT) / 1000;
     // 即時讀值
@@ -458,7 +471,20 @@ function onMotion(ev) {
      1) 扣加速計零偏(body 系)。
      2) 用當前姿態把加速度轉到世界座標系。
      3) 梯形/歐拉積分:v += a·dt,p += v·dt。全程累積,不做 ZUPT。 */
-  const aBody = { x:ax - bias.ax, y:ay - bias.ay, z:az - bias.az };
+  // --- 線性加速度來源(body 系)---
+  let aBody;
+  if (ownAcc && ag.x != null) {
+    // 自算:includingGravity − 姿態估計的重力(陀螺錨定,不吃掉持續加速度的低頻)
+    const gB = qRotateInv(q, { x:0, y:0, z:g0 });   // 世界重力(向上 +Z 慣例)轉回 body 系
+    aBody = {
+      x: (ag.x||0) - gB.x - biasOwn.x,
+      y: (ag.y||0) - gB.y - biasOwn.y,
+      z: (ag.z||0) - gB.z - biasOwn.z
+    };
+  } else {
+    // OS 提供的 linear acceleration(部分廠商有高通/鉗位)
+    aBody = { x:ax - bias.ax, y:ay - bias.ay, z:az - bias.az };
+  }
   const aWorld = qRotate(q, aBody);   // body → world
   lastABody = aBody; lastAWorld = aWorld;
 
@@ -494,9 +520,16 @@ function onMotion(ev) {
   zuptActiveNow = zuptEnabled && zuptHold >= 20;
   if (zuptActiveNow) {
     vel.x = 0; vel.y = 0; vel.z = 0;
-    bias.ax += 0.02 * aBody.x;   // 線上零偏學習(body 系)
-    bias.ay += 0.02 * aBody.y;
-    bias.az += 0.02 * aBody.z;
+    // 線上零偏學習(body 系,寫入目前使用中的來源)
+    if (ownAcc && ag.x != null) {
+      biasOwn.x += 0.02 * aBody.x;
+      biasOwn.y += 0.02 * aBody.y;
+      biasOwn.z += 0.02 * aBody.z;
+    } else {
+      bias.ax += 0.02 * aBody.x;
+      bias.ay += 0.02 * aBody.y;
+      bias.az += 0.02 * aBody.z;
+    }
   }
 
   elapsed = (now - runStartT) / 1000;
@@ -532,7 +565,7 @@ async function startCalibration() {
 
   // 重置
   resetSession();
-  calibSum = { ax:0, ay:0, az:0, gx:0, gy:0, gz:0, n:0 };
+  calibSum = { ax:0, ay:0, az:0, gx:0, gy:0, gz:0, agx:0, agy:0, agz:0, n:0 };
   calibStartT = performance.now();
   lastEventT = 0; dtSmoothed = 0;
 
@@ -556,6 +589,24 @@ function finishCalibration() {
   bias.gx = calibSum.gx / n;
   bias.gy = calibSum.gy / n;
   bias.gz = calibSum.gz / n;
+  biasOwn = { x:0, y:0, z:0 };
+
+  // --- 用平均重力方向初始化姿態(避免 q 從單位四元數慢慢收斂)---
+  // body 系量到的「上」方向 u = mean(includingGravity) 正規化;
+  // 求最短弧四元數把 u 轉到世界 +Z(yaw 無觀測,任意取 0):
+  // q = normalize([1 + u·ẑ, u×ẑ]),u×ẑ = (u.y, −u.x, 0)
+  const agx = calibSum.agx/n, agy = calibSum.agy/n, agz = calibSum.agz/n;
+  const gm = Math.hypot(agx, agy, agz);
+  if (gm > 1) {
+    g0 = gm;                                   // 本地重力實測值(含加速計刻度誤差)
+    const u = { x:agx/gm, y:agy/gm, z:agz/gm };
+    if (1 + u.z > 1e-6) {
+      q = qNorm({ w:1 + u.z, x:u.y, y:-u.x, z:0 });
+    } else {
+      q = { w:0, x:1, y:0, z:0 };              // 手機面朝下的退化情況:繞 X 轉 180°
+    }
+    att = qToEuler(q);
+  }
 
   calibCard.classList.add('hidden');
   timerBar.style.display = 'none';
@@ -646,6 +697,8 @@ function exportCSV() {
     `# device=${navigator.userAgent}`,
     `# start=${sessionStartISO}`,
     `# alpha=${alpha}`,
+    `# acc_source=${ownAcc ? 'own(includingGravity-attitude_gravity)' : 'os_linear'}`,
+    `# g0=${g0.toFixed(4)}`,
     `# bias_accel=${bias.ax.toFixed(5)},${bias.ay.toFixed(5)},${bias.az.toFixed(5)}`,
     `# bias_gyro=${bias.gx.toFixed(5)},${bias.gy.toFixed(5)},${bias.gz.toFixed(5)}`,
     `# mean_hz=${dtSmoothed ? (1/dtSmoothed).toFixed(1) : 'NA'}`
@@ -817,6 +870,7 @@ function updatePanel() {
     timerVal.textContent = elapsed.toFixed(1);
   }
   $('zuptState').textContent = zuptEnabled ? (zuptActiveNow ? 'ON·觸發中' : 'ON') : 'OFF';
+  $('ownAccState').textContent = ownAcc ? '自算' : 'OS';
   $('sAccB').textContent = Math.hypot(lastABody.x, lastABody.y, lastABody.z).toFixed(2);
   $('sAccW').textContent = Math.hypot(lastAWorld.x, lastAWorld.y, lastAWorld.z).toFixed(2);
   $('sDisp').textContent = Math.hypot(pos.x, pos.y).toFixed(3);
