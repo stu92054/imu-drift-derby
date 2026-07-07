@@ -144,6 +144,8 @@
     <div class="stat"><div class="k">水平位移</div><div class="v"><span id="sDisp">0.000</span><span class="u"> m</span></div></div>
     <div class="stat"><div class="k">速度大小</div><div class="v"><span id="sSpeed">0.000</span><span class="u"> m/s</span></div></div>
     <div class="stat"><div class="k">總位移 |r|</div><div class="v"><span id="sDisp3">0.000</span><span class="u"> m</span></div></div>
+    <div class="stat"><div class="k">Body 線性加速度 |a|</div><div class="v"><span id="sAccB">0.00</span><span class="u"> m/s²</span></div></div>
+    <div class="stat"><div class="k">世界系加速度 |a|</div><div class="v"><span id="sAccW">0.00</span><span class="u"> m/s²</span></div></div>
     <div class="stat wide">
       <div class="k">姿態角 (deg)</div>
       <div class="attitude" style="margin-top:4px">
@@ -265,6 +267,10 @@ let q = { w:1, x:0, y:0, z:0 };
 let pos = { x:0, y:0, z:0 };   // 位置 (m)
 let vel = { x:0, y:0, z:0 };   // 速度 (m/s)
 let att = { roll:0, pitch:0, yaw:0 };
+let lastABody = { x:0, y:0, z:0 };   // 最新扣零偏後 body 加速度(診斷顯示用)
+let lastAWorld = { x:0, y:0, z:0 };  // 最新世界系加速度(診斷顯示用)
+let staticBadCount = 0;              // 準靜置但加速度殘差過大的連續樣本數
+let sensorWarned = false;
 
 // ---- 時間 ----
 let runStartT = 0;             // 量測開始 performance.now()
@@ -348,13 +354,14 @@ async function requestSensorPermission() {
 
 // devicemotion 主回呼:所有 IMU 計算都在這裡
 function onMotion(ev) {
-  // --- 計算實際 dt(秒):優先用事件 interval,否則用時間戳實測 ---
+  // --- 計算實際 dt(秒):以 performance.now() 實測為主。
+  //     注意 ev.interval 規格上是「毫秒」(iOS 常回 16.67),只當首拍 fallback 用並轉單位。
   const now = performance.now();
   let dt;
-  if (ev.interval && ev.interval > 0) {
-    dt = ev.interval;                       // iOS 提供的取樣間隔(秒)
-  } else if (lastEventT > 0) {
+  if (lastEventT > 0) {
     dt = (now - lastEventT) / 1000;
+  } else if (ev.interval && ev.interval > 0) {
+    dt = ev.interval > 1 ? ev.interval / 1000 : ev.interval;  // >1 視為 ms
   } else {
     dt = 0.016;
   }
@@ -441,6 +448,20 @@ function onMotion(ev) {
      3) 梯形/歐拉積分:v += a·dt,p += v·dt。全程累積,不做 ZUPT。 */
   const aBody = { x:ax - bias.ax, y:ay - bias.ay, z:az - bias.az };
   const aWorld = qRotate(q, aBody);   // body → world
+  lastABody = aBody; lastAWorld = aWorld;
+
+  // --- 感測器健康度偵測 ---
+  // 準靜置 = 陀螺幾乎不轉 + 總加速度接近 1g。此時線性加速度理應 ≈ 0;
+  // 若殘差持續偏大,代表劇烈晃動讓加速計飽和或污染了 OS 的重力低通估計,
+  // 這個殘差會被二次積分放大成假位移 → 提示使用者重新校正。
+  const gyroDps = Math.hypot(wx, wy, wz) * 180/Math.PI;
+  const aWorldMag = Math.hypot(aWorld.x, aWorld.y, aWorld.z);
+  const quasiStatic = gyroDps < 3 && Math.abs(agMag - 9.81) < 0.6;
+  if (quasiStatic && aWorldMag > 0.35) staticBadCount++; else staticBadCount = 0;
+  if (staticBadCount > 100 && !sensorWarned) {   // 約 1.5~2 秒
+    sensorWarned = true;
+    setStatus('⚠ 手機近乎靜置但線性加速度仍 > 0.35 m/s²:劇烈晃動可能已讓加速計飽和、或污染了 OS 的重力估計(acceleration = includingGravity − 重力低通)。殘差會被二次積分放大。建議「停止」後重新校正。', 'err');
+  }
 
   // 世界系積分(acceleration 已扣重力,理想上靜止時 ≈ 0,殘差就是漂移來源)
   const nvx = vel.x + aWorld.x * dt;
@@ -521,14 +542,16 @@ function finishCalibration() {
    量測 開始 / 停止
    ========================================================================= */
 function startRun() {
-  if (state !== State.READY) return;
-  // 導航狀態歸零(姿態沿用校正後 q,已由陀螺/加速計持續更新)
+  if (state !== State.READY && state !== State.STOPPED) return;
+  // 導航狀態歸零(姿態沿用校正後 q;零偏沿用上次校正)
   pos = { x:0, y:0, z:0 };
   vel = { x:0, y:0, z:0 };
   log = []; traj = [{x:0,y:0}]; errSeries = []; peakDisp = 0;
+  staticBadCount = 0; sensorWarned = false;
   runStartT = performance.now();
   lastEventT = 0;
   sessionStartISO = new Date().toISOString();
+  window.addEventListener('devicemotion', onMotion);  // STOPPED 重新開始時需重掛(重複掛同函式無害)
 
   setState(State.RUN);
   setStatus('量測中:無 ZUPT 修正,觀察位置誤差隨 t² 增長。', 'ok');
@@ -543,7 +566,7 @@ function stopRun() {
   window.removeEventListener('devicemotion', onMotion);
   setState(State.STOPPED);
   timerBar.style.display = 'none';
-  setStatus(`已停止。共 ${log.length} 筆樣本,峰值水平漂移 ${peakDisp.toFixed(2)} m。可匯出 CSV 或重新校正。`, 'ok');
+  setStatus(`已停止。共 ${log.length} 筆樣本,峰值水平漂移 ${peakDisp.toFixed(2)} m。可匯出 CSV、直接再次量測(沿用零偏),或重新校正(劇烈晃動後建議)。`, 'ok');
   releaseWakeLock();
 }
 
@@ -553,6 +576,8 @@ function resetSession() {
   vel = { x:0, y:0, z:0 };
   elapsed = 0; peakDisp = 0;
   log = []; traj = []; errSeries = [];
+  staticBadCount = 0; sensorWarned = false;
+  lastABody = { x:0, y:0, z:0 }; lastAWorld = { x:0, y:0, z:0 };
 }
 
 /* =========================================================================
@@ -762,6 +787,8 @@ function updatePanel() {
     $('sElapsed').textContent = elapsed.toFixed(1);
     timerVal.textContent = elapsed.toFixed(1);
   }
+  $('sAccB').textContent = Math.hypot(lastABody.x, lastABody.y, lastABody.z).toFixed(2);
+  $('sAccW').textContent = Math.hypot(lastAWorld.x, lastAWorld.y, lastAWorld.z).toFixed(2);
   $('sDisp').textContent = Math.hypot(pos.x, pos.y).toFixed(3);
   $('sDisp3').textContent = Math.hypot(pos.x, pos.y, pos.z).toFixed(3);
   $('sSpeed').textContent = Math.hypot(vel.x, vel.y, vel.z).toFixed(3);
@@ -814,7 +841,7 @@ function setState(s) {
   const map = { idle:'待命', calib:'校正中', ready:'已校正', run:'量測中', stopped:'已停止' };
   badge.textContent = map[s] || s;
   btnCalib.disabled  = (s === State.CALIB || s === State.RUN);
-  btnStart.disabled  = (s !== State.READY);
+  btnStart.disabled  = !(s === State.READY || s === State.STOPPED);
   btnStop.disabled   = (s !== State.RUN);
   btnExport.disabled = !(s === State.STOPPED || s === State.RUN) || log.length === 0;
   // 量測中也允許隨時匯出目前累積
