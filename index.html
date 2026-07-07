@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#0a0e14">
+<title>IMU Drift Derby — 慣性導航漂移實驗</title>
+<style>
+  :root {
+    --bg: #0a0e14;
+    --panel: #131a24;
+    --panel-2: #1b2432;
+    --line: #263243;
+    --fg: #e6edf3;
+    --muted: #8794a5;
+    --accent: #4fd1c5;
+    --accent-2: #f6ad55;
+    --danger: #fc8181;
+    --ok: #68d391;
+    --trace: #4fd1c5;
+    --grid: #1e2938;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans TC", "PingFang TC", Roboto, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  body { padding: 12px 12px 40px; max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 18px; margin: 4px 0 2px; letter-spacing: .5px; }
+  .subtitle { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+
+  /* 大字計時器 */
+  #timerBar {
+    display: none;
+    text-align: center;
+    padding: 10px 0 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  #timerBar .t { font-size: 46px; font-weight: 700; letter-spacing: 1px; line-height: 1; }
+  #timerBar .lbl { font-size: 11px; color: var(--muted); letter-spacing: 2px; text-transform: uppercase; }
+  #timerBar.calib .t { color: var(--accent-2); }
+  #timerBar.run .t { color: var(--accent); }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 14px;
+    margin-bottom: 12px;
+  }
+  .card h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; font-weight: 600; }
+
+  /* 按鈕 */
+  .btn {
+    display: block; width: 100%;
+    padding: 18px; margin-bottom: 10px;
+    font-size: 18px; font-weight: 700;
+    border: none; border-radius: 12px;
+    color: #06121a; background: var(--accent);
+    cursor: pointer; transition: transform .05s, opacity .2s;
+  }
+  .btn:active { transform: scale(.98); }
+  .btn.secondary { background: var(--panel-2); color: var(--fg); border: 1px solid var(--line); }
+  .btn.warn { background: var(--accent-2); color: #2a1400; }
+  .btn.danger { background: var(--danger); color: #2a0808; }
+  .btn:disabled { opacity: .35; cursor: not-allowed; }
+
+  /* 數字面板 */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat {
+    background: var(--panel-2); border-radius: 10px; padding: 10px 12px;
+  }
+  .stat .k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .stat .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .stat .u { font-size: 11px; color: var(--muted); font-weight: 400; }
+  .stat.wide { grid-column: 1 / -1; }
+  .attitude { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; }
+  .attitude div { text-align: center; flex: 1; }
+  .attitude .k { font-size: 10px; color: var(--muted); }
+  .attitude .v { font-size: 16px; font-weight: 700; }
+
+  canvas { display: block; width: 100%; border-radius: 10px; background: #0c1119; }
+  .canvas-cap { font-size: 11px; color: var(--muted); margin-top: 6px; display: flex; justify-content: space-between; }
+
+  /* 校正即時讀值 */
+  .live-rows { font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .live-rows .r { display: flex; justify-content: space-between; padding: 2px 0; }
+  .live-rows .r span:last-child { color: var(--fg); font-weight: 600; }
+
+  /* 設定滑桿 */
+  .slider-row { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+  .slider-row label { font-size: 12px; color: var(--muted); min-width: 90px; }
+  .slider-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .slider-row .val { font-size: 12px; font-variant-numeric: tabular-nums; min-width: 42px; text-align: right; color: var(--fg); }
+
+  .status {
+    font-size: 12px; padding: 10px 12px; border-radius: 10px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    margin-bottom: 12px; line-height: 1.5;
+  }
+  .status.err { border-color: var(--danger); color: var(--danger); }
+  .status.ok { border-color: var(--ok); color: var(--ok); }
+  .hz { color: var(--accent); font-weight: 700; }
+  .hidden { display: none !important; }
+  details { margin-top: 8px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .deploy { font-size: 12px; line-height: 1.6; color: var(--muted); }
+  .deploy code { background: #0c1119; padding: 1px 5px; border-radius: 4px; color: var(--accent); font-size: 11px; }
+  .deploy pre { background: #0c1119; padding: 10px; border-radius: 8px; overflow-x: auto; color: var(--fg); }
+  .badge { display: inline-block; font-size: 10px; padding: 2px 7px; border-radius: 20px; background: var(--panel-2); color: var(--muted); margin-left: 6px; }
+</style>
+</head>
+<body>
+
+<h1>IMU Drift Derby <span class="badge" id="stateBadge">待命</span></h1>
+<div class="subtitle">消費級 IMU 二次積分漂移實驗 · 無 ZUPT · 純前端</div>
+
+<!-- 大字計時器(量測/校正中顯示) -->
+<div id="timerBar">
+  <div class="lbl" id="timerLbl">ELAPSED</div>
+  <div class="t" id="timerVal">0.0</div>
+</div>
+
+<!-- 狀態 / 錯誤提示 -->
+<div class="status" id="status">
+  點擊「開始校正」以請求感測器權限。iOS 需在此互動中授權 · 建議使用 Safari(HTTPS)。
+</div>
+
+<!-- 控制按鈕 -->
+<div class="card">
+  <button class="btn warn" id="btnCalib">① 開始校正(靜置 5 秒)</button>
+  <button class="btn" id="btnStart" disabled>② 開始量測</button>
+  <button class="btn danger" id="btnStop" disabled>③ 停止</button>
+  <button class="btn secondary" id="btnExport" disabled>④ 匯出 CSV</button>
+</div>
+
+<!-- 即時數字面板 -->
+<div class="card">
+  <h2>即時狀態 · <span class="hz" id="hzView">-- Hz</span></h2>
+  <div class="grid">
+    <div class="stat"><div class="k">經過時間</div><div class="v"><span id="sElapsed">0.0</span><span class="u"> s</span></div></div>
+    <div class="stat"><div class="k">水平位移</div><div class="v"><span id="sDisp">0.000</span><span class="u"> m</span></div></div>
+    <div class="stat"><div class="k">速度大小</div><div class="v"><span id="sSpeed">0.000</span><span class="u"> m/s</span></div></div>
+    <div class="stat"><div class="k">總位移 |r|</div><div class="v"><span id="sDisp3">0.000</span><span class="u"> m</span></div></div>
+    <div class="stat wide">
+      <div class="k">姿態角 (deg)</div>
+      <div class="attitude" style="margin-top:4px">
+        <div><div class="k">roll</div><div class="v" id="sRoll">0.0</div></div>
+        <div><div class="k">pitch</div><div class="v" id="sPitch">0.0</div></div>
+        <div><div class="k">yaw</div><div class="v" id="sYaw">0.0</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 校正即時讀值(校正期間顯示) -->
+<div class="card hidden" id="calibCard">
+  <h2>零偏校正中 — 保持靜置</h2>
+  <div class="live-rows">
+    <div class="r"><span>accel 均值 (m/s²)</span><span id="cAcc">--</span></div>
+    <div class="r"><span>gyro 均值 (deg/s)</span><span id="cGyr">--</span></div>
+    <div class="r"><span>已收集樣本</span><span id="cN">0</span></div>
+  </div>
+</div>
+
+<!-- 軌跡圖 -->
+<div class="card">
+  <h2>水平面軌跡 (X–Y)</h2>
+  <canvas id="trajCanvas" width="600" height="600"></canvas>
+  <div class="canvas-cap">
+    <span>比例尺:<span id="scaleView">-- m/格</span></span>
+    <span>紅點 = 目前位置</span>
+  </div>
+</div>
+
+<!-- 誤差-時間圖 -->
+<div class="card">
+  <h2>水平漂移 vs 時間(Y 軸 log)</h2>
+  <canvas id="errCanvas" width="600" height="300"></canvas>
+  <div class="canvas-cap">
+    <span>X:時間 (s) · Y:log|位移|</span>
+    <span id="errPeak">peak: -- m</span>
+  </div>
+</div>
+
+<!-- 參數設定 -->
+<div class="card">
+  <h2>濾波參數</h2>
+  <div class="slider-row">
+    <label>互補係數 α</label>
+    <input type="range" id="alpha" min="0.90" max="0.999" step="0.001" value="0.98">
+    <span class="val" id="alphaVal">0.980</span>
+  </div>
+  <div class="subtitle" style="margin:6px 0 0">α 越高越信任陀螺積分;(1−α) 為加速計重力修正權重。</div>
+</div>
+
+<!-- 部署說明 -->
+<div class="card">
+  <h2>部署到 GitHub Pages</h2>
+  <details open>
+    <summary>展開步驟(iOS 感測器需要 HTTPS)</summary>
+    <div class="deploy">
+      <ol>
+        <li>把這個檔案命名為 <code>index.html</code>,放進一個新的 GitHub repo(例如 <code>imu-drift-derby</code>)。</li>
+        <li>推上去:
+<pre>git init
+git add index.html
+git commit -m "IMU drift derby"
+git branch -M main
+git remote add origin https://github.com/&lt;你的帳號&gt;/imu-drift-derby.git
+git push -u origin main</pre>
+        </li>
+        <li>GitHub → repo → <b>Settings → Pages</b> → Source 選 <code>Deploy from a branch</code> → Branch 選 <code>main</code> / <code>/(root)</code> → Save。</li>
+        <li>約 1 分鐘後網址會是 <code>https://&lt;帳號&gt;.github.io/imu-drift-derby/</code>,已是 <b>HTTPS</b>。</li>
+        <li>用手機 Safari / Chrome 開該網址。iOS 13+ 點「開始校正」時會跳權限請求(必須由此點擊觸發)。</li>
+      </ol>
+      <b>為什麼要 HTTPS:</b> iOS 的 DeviceMotion 權限與 <code>requestPermission()</code> 只在安全來源(HTTPS 或 localhost)可用;GitHub Pages 預設就是 HTTPS。
+    </div>
+  </details>
+</div>
+
+<script>
+"use strict";
+
+/* =========================================================================
+   IMU Drift Derby
+   純前端慣性導航漂移實驗。所有 IMU 計算在 devicemotion 回呼中做,
+   繪圖用 requestAnimationFrame 節流。
+   座標系:世界座標 Z 軸朝上(重力 -Z);裝置(body)座標由感測器定義。
+   姿態:四元數 q(body→world),互補濾波器融合陀螺積分 + 加速計重力方向。
+   ========================================================================= */
+
+// ---- DOM ----
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+const badge = $('stateBadge');
+const timerBar = $('timerBar'), timerVal = $('timerVal'), timerLbl = $('timerLbl');
+const btnCalib = $('btnCalib'), btnStart = $('btnStart'), btnStop = $('btnStop'), btnExport = $('btnExport');
+const hzView = $('hzView');
+const calibCard = $('calibCard');
+
+// ---- 狀態機 ----
+const State = { IDLE:'idle', CALIB:'calib', READY:'ready', RUN:'run', STOPPED:'stopped' };
+let state = State.IDLE;
+
+// ---- 濾波 / 校正參數 ----
+let alpha = 0.98;                       // 互補濾波係數(陀螺權重)
+$('alpha').addEventListener('input', e => {
+  alpha = parseFloat(e.target.value);
+  $('alphaVal').textContent = alpha.toFixed(3);
+});
+
+// ---- 校正資料(零偏)----
+const CALIB_SECONDS = 5;
+let calibStartT = 0;
+let calibSum = { ax:0, ay:0, az:0, gx:0, gy:0, gz:0, n:0 };
+let bias = { ax:0, ay:0, az:0, gx:0, gy:0, gz:0 };  // 加速計/陀螺零偏(全程扣除)
+
+// ---- 姿態四元數(body→world),初始化為單位 ----
+let q = { w:1, x:0, y:0, z:0 };
+
+// ---- 導航狀態(世界座標)----
+let pos = { x:0, y:0, z:0 };   // 位置 (m)
+let vel = { x:0, y:0, z:0 };   // 速度 (m/s)
+let att = { roll:0, pitch:0, yaw:0 };
+
+// ---- 時間 ----
+let runStartT = 0;             // 量測開始 performance.now()
+let lastEventT = 0;            // 上一次 devicemotion 時間(算 dt 用)
+let elapsed = 0;               // 量測經過秒數
+let dtSmoothed = 0;            // 平滑後的 dt(顯示 Hz 用)
+
+// ---- 記錄(CSV)----
+let log = [];                  // 每筆量測樣本
+let traj = [];                 // 軌跡點 {x,y}(繪圖用,降採樣)
+let errSeries = [];            // {t, d} 水平位移-時間
+let peakDisp = 0;
+let sessionStartISO = '';      // 開始量測的 ISO 時間(檔名用)
+
+/* =========================================================================
+   四元數工具
+   ========================================================================= */
+function qMul(a, b) {
+  return {
+    w: a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z,
+    x: a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+    y: a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+    z: a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w
+  };
+}
+function qNorm(a) {
+  const n = Math.hypot(a.w, a.x, a.y, a.z) || 1;
+  return { w:a.w/n, x:a.x/n, y:a.y/n, z:a.z/n };
+}
+// 用四元數把 body 向量旋轉到 world:v' = q ⊗ (0,v) ⊗ q*
+function qRotate(a, v) {
+  const t = qMul(a, { w:0, x:v.x, y:v.y, z:v.z });
+  const c = { w:a.w, x:-a.x, y:-a.y, z:-a.z };
+  const r = qMul(t, c);
+  return { x:r.x, y:r.y, z:r.z };
+}
+// 反向旋轉(world→body):用共軛
+function qRotateInv(a, v) {
+  const c = { w:a.w, x:-a.x, y:-a.y, z:-a.z };
+  return qRotate(c, v);
+}
+// 四元數 → roll/pitch/yaw (ZYX, rad)
+function qToEuler(a) {
+  const { w, x, y, z } = a;
+  const roll  = Math.atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y));
+  let s = 2*(w*y - z*x);
+  s = Math.max(-1, Math.min(1, s));
+  const pitch = Math.asin(s);
+  const yaw   = Math.atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z));
+  return { roll, pitch, yaw };
+}
+
+/* =========================================================================
+   感測器接入 + 權限
+   ========================================================================= */
+function needsPermission() {
+  return typeof DeviceMotionEvent !== 'undefined'
+      && typeof DeviceMotionEvent.requestPermission === 'function';
+}
+
+async function requestSensorPermission() {
+  if (!('DeviceMotionEvent' in window)) {
+    setStatus('此瀏覽器不支援 DeviceMotionEvent,無法讀取 IMU。', 'err');
+    return false;
+  }
+  if (needsPermission()) {
+    // iOS 13+:必須在使用者點擊事件中呼叫
+    try {
+      const res = await DeviceMotionEvent.requestPermission();
+      if (res !== 'granted') {
+        setStatus('感測器權限被拒絕。請到 Safari「網站設定 → 動作與方向」允許,或重新整理再試。', 'err');
+        return false;
+      }
+    } catch (err) {
+      setStatus('請求感測器權限失敗(需在 HTTPS 且由點擊觸發):' + err.message, 'err');
+      return false;
+    }
+  }
+  return true;
+}
+
+// devicemotion 主回呼:所有 IMU 計算都在這裡
+function onMotion(ev) {
+  // --- 計算實際 dt(秒):優先用事件 interval,否則用時間戳實測 ---
+  const now = performance.now();
+  let dt;
+  if (ev.interval && ev.interval > 0) {
+    dt = ev.interval;                       // iOS 提供的取樣間隔(秒)
+  } else if (lastEventT > 0) {
+    dt = (now - lastEventT) / 1000;
+  } else {
+    dt = 0.016;
+  }
+  lastEventT = now;
+  // 防呆:異常 dt(切分頁、丟事件)截斷,避免積分爆掉
+  if (dt <= 0 || dt > 0.2) dt = 0.02;
+  dtSmoothed = dtSmoothed ? dtSmoothed*0.9 + dt*0.1 : dt;
+
+  // --- 讀感測器 ---
+  const a  = ev.acceleration || {};                 // 已扣重力(線性加速度)
+  const ag = ev.accelerationIncludingGravity || {}; // 含重力(拿來估重力方向)
+  const r  = ev.rotationRate || {};                 // deg/s;alpha=z, beta=x, gamma=y
+
+  // 有些 Android 只給 accelerationIncludingGravity;fallback
+  const ax = (a.x != null ? a.x : 0);
+  const ay = (a.y != null ? a.y : 0);
+  const az = (a.z != null ? a.z : 0);
+  // rotationRate 軸對應:beta→x, gamma→y, alpha→z(deg/s)
+  const gxDeg = (r.beta  != null ? r.beta  : 0);
+  const gyDeg = (r.gamma != null ? r.gamma : 0);
+  const gzDeg = (r.alpha != null ? r.alpha : 0);
+
+  // === 校正階段:累積零偏,不做導航 ===
+  if (state === State.CALIB) {
+    calibSum.ax += ax; calibSum.ay += ay; calibSum.az += az;
+    calibSum.gx += gxDeg; calibSum.gy += gyDeg; calibSum.gz += gzDeg;
+    calibSum.n++;
+    const t = (now - calibStartT) / 1000;
+    // 即時讀值
+    $('cAcc').textContent = `${ax.toFixed(2)}, ${ay.toFixed(2)}, ${az.toFixed(2)}`;
+    $('cGyr').textContent = `${gxDeg.toFixed(1)}, ${gyDeg.toFixed(1)}, ${gzDeg.toFixed(1)}`;
+    $('cN').textContent = calibSum.n;
+    timerVal.textContent = Math.max(0, CALIB_SECONDS - t).toFixed(1);
+    if (t >= CALIB_SECONDS) finishCalibration();
+    return;
+  }
+
+  if (state !== State.RUN) return;
+
+  /* ===================== 姿態估計:互補濾波器 =====================
+     1) 陀螺積分:用角速度 ω(rad/s)以指數映射更新四元數(避免萬向鎖)。
+     2) 加速計修正:靜/緩動時 accelerationIncludingGravity ≈ 重力方向,
+        用它把姿態的傾斜(roll/pitch)拉回,權重 (1−α)。yaw 無磁力計故自由漂移。 */
+
+  // 陀螺零偏扣除(轉 rad/s)
+  const wx = (gxDeg - bias.gx) * Math.PI/180;
+  const wy = (gyDeg - bias.gy) * Math.PI/180;
+  const wz = (gzDeg - bias.gz) * Math.PI/180;
+
+  // 指數映射:Δq = [cos(θ/2), axis*sin(θ/2)],θ = |ω|·dt
+  const wMag = Math.hypot(wx, wy, wz);
+  let dq;
+  if (wMag > 1e-8) {
+    const theta = wMag * dt;
+    const s = Math.sin(theta/2) / wMag;
+    dq = { w:Math.cos(theta/2), x:wx*s, y:wy*s, z:wz*s };
+  } else {
+    dq = { w:1, x:0, y:0, z:0 };
+  }
+  q = qNorm(qMul(q, dq));   // 陀螺預測(body 系右乘)
+
+  // 加速計重力修正(只在加速度接近 1g 時採信,排除劇烈運動污染)
+  const agMag = Math.hypot(ag.x||0, ag.y||0, ag.z||0);
+  if (agMag > 1e-3 && Math.abs(agMag - 9.81) < 4.0) {
+    // 量測的重力方向(body 系,指向上方=遠離地心的反向;normalize)
+    const mUp = { x:(ag.x||0)/agMag, y:(ag.y||0)/agMag, z:(ag.z||0)/agMag };
+    // 由目前姿態預測的世界上方向 [0,0,1] 在 body 系的樣子
+    const pUp = qRotateInv(q, { x:0, y:0, z:1 });
+    // 誤差 = 量測 × 預測(body 系旋轉軸),小角度修正
+    const ex = mUp.y*pUp.z - mUp.z*pUp.y;
+    const ey = mUp.z*pUp.x - mUp.x*pUp.z;
+    const ez = mUp.x*pUp.y - mUp.y*pUp.x;
+    const gain = (1 - alpha);            // 加速計權重
+    // 把小旋轉誤差當作四元數修正右乘進去
+    const corr = qNorm({ w:1, x:ex*gain, y:ey*gain, z:ez*gain });
+    q = qNorm(qMul(q, corr));
+  }
+
+  att = qToEuler(q);
+
+  /* ===================== 慣性導航二次積分 =====================
+     1) 扣加速計零偏(body 系)。
+     2) 用當前姿態把加速度轉到世界座標系。
+     3) 梯形/歐拉積分:v += a·dt,p += v·dt。全程累積,不做 ZUPT。 */
+  const aBody = { x:ax - bias.ax, y:ay - bias.ay, z:az - bias.az };
+  const aWorld = qRotate(q, aBody);   // body → world
+
+  // 世界系積分(acceleration 已扣重力,理想上靜止時 ≈ 0,殘差就是漂移來源)
+  const nvx = vel.x + aWorld.x * dt;
+  const nvy = vel.y + aWorld.y * dt;
+  const nvz = vel.z + aWorld.z * dt;
+  // 梯形積分位置(用前後速度平均,較歐拉準)
+  pos.x += (vel.x + nvx) * 0.5 * dt;
+  pos.y += (vel.y + nvy) * 0.5 * dt;
+  pos.z += (vel.z + nvz) * 0.5 * dt;
+  vel.x = nvx; vel.y = nvy; vel.z = nvz;
+
+  elapsed = (now - runStartT) / 1000;
+
+  // --- 記錄 CSV 樣本 ---
+  log.push([
+    elapsed.toFixed(4),
+    aBody.x.toFixed(5), aBody.y.toFixed(5), aBody.z.toFixed(5),
+    (gxDeg-bias.gx).toFixed(4), (gyDeg-bias.gy).toFixed(4), (gzDeg-bias.gz).toFixed(4),
+    pos.x.toFixed(5), pos.y.toFixed(5), pos.z.toFixed(5),
+    Math.hypot(vel.x, vel.y, vel.z).toFixed(5),
+    (att.roll*180/Math.PI).toFixed(3), (att.pitch*180/Math.PI).toFixed(3), (att.yaw*180/Math.PI).toFixed(3)
+  ]);
+
+  // --- 軌跡 / 誤差序列(降採樣以免爆記憶體)---
+  const hDisp = Math.hypot(pos.x, pos.y);
+  if (hDisp > peakDisp) peakDisp = hDisp;
+  if (log.length % 3 === 0) {
+    traj.push({ x:pos.x, y:pos.y });
+    errSeries.push({ t:elapsed, d:hDisp });
+    if (traj.length > 4000) traj.shift();
+    if (errSeries.length > 4000) errSeries.shift();
+  }
+}
+
+/* =========================================================================
+   校正流程
+   ========================================================================= */
+async function startCalibration() {
+  const ok = await requestSensorPermission();
+  if (!ok) return;
+
+  // 重置
+  resetSession();
+  calibSum = { ax:0, ay:0, az:0, gx:0, gy:0, gz:0, n:0 };
+  calibStartT = performance.now();
+  lastEventT = 0; dtSmoothed = 0;
+
+  window.addEventListener('devicemotion', onMotion);
+  setState(State.CALIB);
+  setStatus('校正中:請將手機平放靜置,收集 5 秒零偏資料…', 'ok');
+  calibCard.classList.remove('hidden');
+  timerBar.style.display = 'block';
+  timerBar.className = 'calib';
+  timerLbl.textContent = 'CALIBRATING';
+  requestWakeLock();
+}
+
+function finishCalibration() {
+  const n = calibSum.n || 1;
+  // 加速計零偏:靜置時 acceleration(已扣重力)理想為 0,平均即殘餘零偏
+  bias.ax = calibSum.ax / n;
+  bias.ay = calibSum.ay / n;
+  bias.az = calibSum.az / n;
+  // 陀螺零偏:靜置時角速度應為 0
+  bias.gx = calibSum.gx / n;
+  bias.gy = calibSum.gy / n;
+  bias.gz = calibSum.gz / n;
+
+  calibCard.classList.add('hidden');
+  timerBar.style.display = 'none';
+  setState(State.READY);
+  setStatus(
+    `校正完成(${n} 樣本)。accel 零偏 [${bias.ax.toFixed(3)}, ${bias.ay.toFixed(3)}, ${bias.az.toFixed(3)}] m/s²,`
+    + ` gyro 零偏 [${bias.gx.toFixed(2)}, ${bias.gy.toFixed(2)}, ${bias.gz.toFixed(2)}] °/s。可「開始量測」。`, 'ok');
+}
+
+/* =========================================================================
+   量測 開始 / 停止
+   ========================================================================= */
+function startRun() {
+  if (state !== State.READY) return;
+  // 導航狀態歸零(姿態沿用校正後 q,已由陀螺/加速計持續更新)
+  pos = { x:0, y:0, z:0 };
+  vel = { x:0, y:0, z:0 };
+  log = []; traj = [{x:0,y:0}]; errSeries = []; peakDisp = 0;
+  runStartT = performance.now();
+  lastEventT = 0;
+  sessionStartISO = new Date().toISOString();
+
+  setState(State.RUN);
+  setStatus('量測中:無 ZUPT 修正,觀察位置誤差隨 t² 增長。', 'ok');
+  timerBar.style.display = 'block';
+  timerBar.className = 'run';
+  timerLbl.textContent = 'ELAPSED';
+  requestWakeLock();
+}
+
+function stopRun() {
+  if (state !== State.RUN) return;
+  window.removeEventListener('devicemotion', onMotion);
+  setState(State.STOPPED);
+  timerBar.style.display = 'none';
+  setStatus(`已停止。共 ${log.length} 筆樣本,峰值水平漂移 ${peakDisp.toFixed(2)} m。可匯出 CSV 或重新校正。`, 'ok');
+  releaseWakeLock();
+}
+
+function resetSession() {
+  q = { w:1, x:0, y:0, z:0 };
+  pos = { x:0, y:0, z:0 };
+  vel = { x:0, y:0, z:0 };
+  elapsed = 0; peakDisp = 0;
+  log = []; traj = []; errSeries = [];
+}
+
+/* =========================================================================
+   CSV 匯出
+   檔名 = 裝置型號 + 開始 ISO 時間,避免一堆 data.csv 撞名
+   ========================================================================= */
+function deviceTag() {
+  const ua = navigator.userAgent;
+  let model = 'device';
+  if (/iPhone/.test(ua))      model = 'iPhone';
+  else if (/iPad/.test(ua))   model = 'iPad';
+  else {
+    // Android:抓 (…; MODEL Build/…);否則退回括號內最後一段
+    const m = ua.match(/;\s*([^;)]+?)\s+Build\//);
+    if (m && m[1]) model = m[1].trim();
+    else {
+      const paren = ua.match(/\(([^)]+)\)/);
+      if (paren) model = paren[1].split(';').pop().trim();
+    }
+  }
+  return model.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 40) || 'device';
+}
+
+function exportCSV() {
+  if (!log.length) { setStatus('沒有資料可匯出。', 'err'); return; }
+  const header = [
+    'timestamp_s',
+    'ax_ms2','ay_ms2','az_ms2',
+    'gx_dps','gy_dps','gz_dps',
+    'pos_x_m','pos_y_m','pos_z_m',
+    'speed_ms',
+    'roll_deg','pitch_deg','yaw_deg'
+  ].join(',');
+  const body = log.map(r => r.join(',')).join('\n');
+  // 檔頭附上 metadata 註解(以 # 開頭,分析時可略過)
+  const meta = [
+    `# device=${navigator.userAgent}`,
+    `# start=${sessionStartISO}`,
+    `# alpha=${alpha}`,
+    `# bias_accel=${bias.ax.toFixed(5)},${bias.ay.toFixed(5)},${bias.az.toFixed(5)}`,
+    `# bias_gyro=${bias.gx.toFixed(5)},${bias.gy.toFixed(5)},${bias.gz.toFixed(5)}`,
+    `# mean_hz=${dtSmoothed ? (1/dtSmoothed).toFixed(1) : 'NA'}`
+  ].join('\n');
+  const csv = meta + '\n' + header + '\n' + body + '\n';
+
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  // 檔名:imu_<型號>_<ISO時間>.csv(冒號在檔名不合法,替換掉)
+  const isoSafe = (sessionStartISO || new Date().toISOString()).replace(/[:.]/g, '-');
+  const fname = `imu_${deviceTag()}_${isoSafe}.csv`;
+  const a = document.createElement('a');
+  a.href = url; a.download = fname;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  setStatus('已匯出:' + fname, 'ok');
+}
+
+/* =========================================================================
+   繪圖(requestAnimationFrame 節流,不在 sensor 回呼每筆重繪)
+   ========================================================================= */
+const trajCanvas = $('trajCanvas'), trajCtx = trajCanvas.getContext('2d');
+const errCanvas = $('errCanvas'), errCtx = errCanvas.getContext('2d');
+
+// 依裝置像素比設定 canvas 實際解析度
+function fitCanvas(canvas, ctx) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cssW = canvas.clientWidth;
+  const cssH = parseInt(canvas.getAttribute('data-h') || (canvas === trajCanvas ? cssW : cssW/2));
+  if (canvas.width !== Math.round(cssW*dpr) || canvas.height !== Math.round(cssH*dpr)) {
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    canvas.style.height = cssH + 'px';
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { w: cssW, h: cssH };
+}
+trajCanvas.setAttribute('data-h', '');
+errCanvas.setAttribute('data-h', '');
+
+// 選一個「漂亮」的比例尺(1,2,5 × 10^n)
+function niceStep(raw) {
+  if (raw <= 0 || !isFinite(raw)) return 1;
+  const pow = Math.pow(10, Math.floor(Math.log10(raw)));
+  const f = raw / pow;
+  let nf;
+  if (f < 1.5) nf = 1; else if (f < 3.5) nf = 2; else if (f < 7.5) nf = 5; else nf = 10;
+  return nf * pow;
+}
+
+function drawTrajectory() {
+  const { w, h } = fitCanvas(trajCanvas, trajCtx);
+  const ctx = trajCtx;
+  ctx.clearRect(0, 0, w, h);
+  const cx = w/2, cy = h/2;
+
+  // 依目前最大範圍自動縮放
+  let maxR = 0.5;
+  for (const p of traj) maxR = Math.max(maxR, Math.abs(p.x), Math.abs(p.y));
+  maxR = Math.max(maxR, Math.abs(pos.x), Math.abs(pos.y));
+  maxR *= 1.15;                                   // 邊界留白
+  const half = Math.min(w, h)/2 - 8;
+  const gridCells = 5;                            // 半邊 5 格
+  const step = niceStep(maxR / gridCells);        // 每格公尺
+  const ppm = half / (step * gridCells);          // pixels per meter
+  $('scaleView').textContent = step >= 1 ? step + ' m/格' : step.toFixed(3) + ' m/格';
+
+  // 網格
+  ctx.strokeStyle = getCss('--grid'); ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = -gridCells; i <= gridCells; i++) {
+    const d = i * step * ppm;
+    ctx.moveTo(cx + d, cy - half); ctx.lineTo(cx + d, cy + half);
+    ctx.moveTo(cx - half, cy + d); ctx.lineTo(cx + half, cy + d);
+  }
+  ctx.stroke();
+  // 原點軸
+  ctx.strokeStyle = '#3a4a60'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy-half); ctx.lineTo(cx, cy+half);
+  ctx.moveTo(cx-half, cy); ctx.lineTo(cx+half, cy);
+  ctx.stroke();
+
+  // 軌跡(世界 X→畫布右,世界 Y→畫布上)
+  if (traj.length > 1) {
+    ctx.strokeStyle = getCss('--trace'); ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    for (let i = 0; i < traj.length; i++) {
+      const px = cx + traj[i].x * ppm;
+      const py = cy - traj[i].y * ppm;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  }
+  // 原點
+  ctx.fillStyle = '#5a6b82';
+  ctx.beginPath(); ctx.arc(cx, cy, 4, 0, 7); ctx.fill();
+  // 目前位置(紅點)
+  const rx = cx + pos.x * ppm, ry = cy - pos.y * ppm;
+  ctx.fillStyle = '#fc5555';
+  ctx.beginPath(); ctx.arc(rx, ry, 6, 0, 7); ctx.fill();
+  ctx.strokeStyle = 'rgba(252,85,85,.4)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.arc(rx, ry, 11, 0, 7); ctx.stroke();
+}
+
+function drawErrorPlot() {
+  const { w, h } = fitCanvas(errCanvas, errCtx);
+  const ctx = errCtx;
+  ctx.clearRect(0, 0, w, h);
+  const padL = 40, padB = 22, padT = 10, padR = 8;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+
+  // 座標範圍:X 時間,Y = log10(位移)
+  const tMax = Math.max(5, elapsed);
+  // log 範圍:1mm(-3)到 peak
+  const dMax = Math.max(0.01, peakDisp);
+  const yLo = -3;                                  // 1 mm
+  const yHi = Math.ceil(Math.log10(dMax) + 0.01);
+
+  const X = t => padL + (t / tMax) * plotW;
+  const Y = d => {
+    const ld = Math.log10(Math.max(1e-4, d));
+    const f = (ld - yLo) / (yHi - yLo);
+    return padT + (1 - Math.max(0, Math.min(1, f))) * plotH;
+  };
+
+  // Y 網格(每個 10 的次方一條)
+  ctx.strokeStyle = getCss('--grid'); ctx.fillStyle = getCss('--muted');
+  ctx.lineWidth = 1; ctx.font = '10px sans-serif'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  for (let e = yLo; e <= yHi; e++) {
+    const yy = padT + (1 - (e - yLo)/(yHi - yLo)) * plotH;
+    ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(w - padR, yy); ctx.stroke();
+    const lbl = e >= 0 ? Math.pow(10,e) + 'm' : (Math.pow(10,e)).toString().replace(/0+$/,'') + 'm';
+    ctx.fillText(lbl, padL - 4, yy);
+  }
+  // X 軸刻度
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  for (let i = 0; i <= 4; i++) {
+    const t = tMax * i/4;
+    const xx = X(t);
+    ctx.fillText(t.toFixed(0)+'s', xx, h - padB + 4);
+  }
+
+  // 曲線
+  if (errSeries.length > 1) {
+    ctx.strokeStyle = getCss('--accent-2'); ctx.lineWidth = 2; ctx.beginPath();
+    let started = false;
+    for (const s of errSeries) {
+      const px = X(s.t), py = Y(s.d);
+      if (!started) { ctx.moveTo(px, py); started = true; } else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+  }
+  $('errPeak').textContent = 'peak: ' + peakDisp.toFixed(3) + ' m';
+}
+
+// 讀 CSS 變數
+function getCss(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || '#4fd1c5';
+}
+
+// 更新數字面板 + 計時器
+function updatePanel() {
+  hzView.textContent = dtSmoothed ? (1/dtSmoothed).toFixed(1) + ' Hz' : '-- Hz';
+  if (state === State.RUN) {
+    $('sElapsed').textContent = elapsed.toFixed(1);
+    timerVal.textContent = elapsed.toFixed(1);
+  }
+  $('sDisp').textContent = Math.hypot(pos.x, pos.y).toFixed(3);
+  $('sDisp3').textContent = Math.hypot(pos.x, pos.y, pos.z).toFixed(3);
+  $('sSpeed').textContent = Math.hypot(vel.x, vel.y, vel.z).toFixed(3);
+  $('sRoll').textContent  = (att.roll*180/Math.PI).toFixed(1);
+  $('sPitch').textContent = (att.pitch*180/Math.PI).toFixed(1);
+  $('sYaw').textContent   = (att.yaw*180/Math.PI).toFixed(1);
+}
+
+// rAF 主繪圖迴圈(節流)
+function renderLoop() {
+  updatePanel();
+  drawTrajectory();
+  drawErrorPlot();
+  requestAnimationFrame(renderLoop);
+}
+requestAnimationFrame(renderLoop);
+
+/* =========================================================================
+   Wake Lock(螢幕保持喚醒)
+   ========================================================================= */
+let wakeLock = null;
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator)) {
+    // 不支援:提示使用者手動關閉自動鎖定
+    appendStatusHint('⚠ 此瀏覽器不支援 Wake Lock,請手動把螢幕自動鎖定關掉,避免量測中斷。');
+    return;
+  }
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => {});
+  } catch (e) {
+    appendStatusHint('⚠ 無法取得 Wake Lock(' + e.message + '),請手動關閉自動鎖定。');
+  }
+}
+function releaseWakeLock() {
+  if (wakeLock) { wakeLock.release().catch(()=>{}); wakeLock = null; }
+}
+// 切回分頁時重新取得
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && (state === State.RUN || state === State.CALIB)) {
+    requestWakeLock();
+  }
+});
+
+/* =========================================================================
+   UI 狀態
+   ========================================================================= */
+function setState(s) {
+  state = s;
+  const map = { idle:'待命', calib:'校正中', ready:'已校正', run:'量測中', stopped:'已停止' };
+  badge.textContent = map[s] || s;
+  btnCalib.disabled  = (s === State.CALIB || s === State.RUN);
+  btnStart.disabled  = (s !== State.READY);
+  btnStop.disabled   = (s !== State.RUN);
+  btnExport.disabled = !(s === State.STOPPED || s === State.RUN) || log.length === 0;
+  // 量測中也允許隨時匯出目前累積
+  if (s === State.RUN) btnExport.disabled = true;
+}
+
+let baseStatus = '';
+function setStatus(msg, kind) {
+  baseStatus = msg;
+  statusEl.textContent = msg;
+  statusEl.className = 'status' + (kind ? ' ' + kind : '');
+}
+function appendStatusHint(hint) {
+  statusEl.textContent = baseStatus + '  ' + hint;
+}
+
+// 綁定按鈕
+btnCalib.addEventListener('click', startCalibration);
+btnStart.addEventListener('click', startRun);
+btnStop.addEventListener('click', () => { stopRun(); btnExport.disabled = log.length === 0; });
+btnExport.addEventListener('click', exportCSV);
+
+// 初始
+setState(State.IDLE);
+</script>
+</body>
+</html>
