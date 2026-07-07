@@ -692,7 +692,19 @@ function resetSession() {
    CSV 匯出
    檔名 = 裝置型號 + 開始 ISO 時間,避免一堆 data.csv 撞名
    ========================================================================= */
+// UA Client Hints:Android Chrome 的正確型號管道(async,頁面載入時先取好)
+let uaModel = '', uaHints = '';
+if (navigator.userAgentData && navigator.userAgentData.getHighEntropyValues) {
+  navigator.userAgentData.getHighEntropyValues(['model', 'platform', 'platformVersion'])
+    .then(v => {
+      uaModel = (v.model || '').trim();
+      uaHints = `${v.platform||''} ${v.platformVersion||''} ${v.model||''}`.trim();
+    }).catch(() => {});
+}
+
 function deviceTag() {
+  // Android:優先用 Client Hints 的精確型號(UA 字串可能被凍結)
+  if (uaModel) return uaModel.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 40);
   const ua = navigator.userAgent;
   let model = 'device';
   if (/iPhone/.test(ua))      model = 'iPhone';
@@ -726,6 +738,9 @@ function buildCSV() {
   // 檔頭附上 metadata 註解(以 # 開頭,分析時可略過)
   const meta = [
     `# device=${navigator.userAgent}`,
+    `# ua_hints=${uaHints || 'NA'}`,                          // Android Chrome 精確型號
+    `# screen=${screen.width}x${screen.height}@${window.devicePixelRatio}`,  // iOS 反查機型用
+    `# platform=${navigator.platform || 'NA'}`,
     `# start=${sessionStartISO}`,
     `# tau_s=${tau}`,
     `# acc_source=${ownAcc ? 'own(includingGravity-attitude_gravity)' : 'os_linear'}`,
