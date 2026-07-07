@@ -297,6 +297,8 @@ let lastABody = { x:0, y:0, z:0 };   // 最新扣零偏後 body 加速度(診斷
 let lastAWorld = { x:0, y:0, z:0 };  // 最新世界系加速度(診斷顯示用)
 let staticBadCount = 0;              // 準靜置但加速度殘差過大的連續樣本數
 let sensorWarned = false;
+let jerkCount = 0;                   // 資料品質:樣本間 |ag| 突跳(>5 m/s²)次數
+let lastAgMagJ = null;               // 60Hz 取樣會漏掉窄脈衝,jerk 多 = 積分不可信
 
 // ---- 時間 ----
 let runStartT = 0;             // 量測開始 performance.now()
@@ -456,6 +458,10 @@ function onMotion(ev) {
   const agMag = Math.hypot(ag.x||0, ag.y||0, ag.z||0);
   const gyroDps = Math.hypot(wx, wy, wz) * 180/Math.PI;
   const stillNow = gyroDps < 3 && agMag > 1e-3 && Math.abs(agMag - g0) < 0.6;
+  // 資料品質:相鄰樣本 |ag| 突跳計數(布面 stick-slip / 撞擊的指紋)
+  if (lastAgMagJ !== null && Math.abs(agMag - lastAgMagJ) > 5) jerkCount++;
+  lastAgMagJ = agMag;
+
   if (stillNow) { stillHold++; if (stillHold === 1) stillStartT = now; } else stillHold = 0;
   const isStill = stillHold >= 20;   // 持續 ~0.2–0.3 s 才算靜止
   let corrGain = 0;                  // 本樣本實際使用的重力修正增益(log 用)
@@ -665,6 +671,7 @@ function startRun() {
   vel = { x:0, y:0, z:0 };
   log = []; traj = [{x:0,y:0}]; errSeries = []; peakDisp = 0;
   staticBadCount = 0; sensorWarned = false;
+  jerkCount = 0; lastAgMagJ = null;
   runStartT = performance.now();
   lastEventT = 0;
   sessionStartISO = new Date().toISOString();
@@ -683,7 +690,10 @@ function stopRun() {
   window.removeEventListener('devicemotion', onMotion);
   setState(State.STOPPED);
   timerBar.style.display = 'none';
-  setStatus(`已停止。共 ${log.length} 筆樣本,峰值水平漂移 ${peakDisp.toFixed(2)} m。可匯出 CSV、直接再次量測(沿用零偏),或重新校正(劇烈晃動後建議)。`, 'ok');
+  const jerkNote = jerkCount > 10
+    ? `⚠ jerk 事件 ${jerkCount} 次(表面顛簸,60Hz 取樣會漏窄脈衝,位移可信度低)`
+    : `jerk 事件 ${jerkCount} 次(資料品質良好)`;
+  setStatus(`已停止。共 ${log.length} 筆樣本,峰值水平漂移 ${peakDisp.toFixed(2)} m。${jerkNote}。可匯出 CSV、再次量測,或重新校正。`, 'ok');
   releaseWakeLock();
 }
 
@@ -757,7 +767,8 @@ function buildCSV() {
     `# g0=${g0.toFixed(4)}`,
     `# bias_accel=${bias.ax.toFixed(5)},${bias.ay.toFixed(5)},${bias.az.toFixed(5)}`,
     `# bias_gyro=${bias.gx.toFixed(5)},${bias.gy.toFixed(5)},${bias.gz.toFixed(5)}`,
-    `# mean_hz=${dtSmoothed ? (1/dtSmoothed).toFixed(1) : 'NA'}`
+    `# mean_hz=${dtSmoothed ? (1/dtSmoothed).toFixed(1) : 'NA'}`,
+    `# jerk_events=${jerkCount}`
   ].join('\n');
   const csv = meta + '\n' + header + '\n' + body + '\n';
   // 檔名:imu_<型號>_<ISO時間>.csv(冒號在檔名不合法,替換掉)
