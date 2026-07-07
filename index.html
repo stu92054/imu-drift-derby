@@ -191,11 +191,11 @@
 <div class="card">
   <h2>濾波參數</h2>
   <div class="slider-row">
-    <label>互補係數 α</label>
-    <input type="range" id="alpha" min="0.90" max="0.999" step="0.001" value="0.98">
-    <span class="val" id="alphaVal">0.980</span>
+    <label>重力修正 τ</label>
+    <input type="range" id="tau" min="2" max="60" step="1" value="20">
+    <span class="val" id="tauVal">20 s</span>
   </div>
-  <div class="subtitle" style="margin:6px 0 0">α 越高越信任陀螺積分;(1−α) 為加速計重力修正權重。</div>
+  <div class="subtitle" style="margin:6px 0 0">姿態被加速計「上」方向拉回的時間常數。τ 小 → 持續加速度被吸進重力(高通效應,軌跡走回頭路,重現三星行為);τ 大 → 淨位移保留但姿態誤差修得慢。試試 τ=2 vs τ=40 推同一段床。</div>
   <div class="slider-row" style="margin-top:12px">
     <label>ZUPT 零速修正</label>
     <input type="checkbox" id="zuptChk" style="width:22px;height:22px;accent-color:var(--accent)">
@@ -260,10 +260,10 @@ const State = { IDLE:'idle', CALIB:'calib', READY:'ready', RUN:'run', STOPPED:'s
 let state = State.IDLE;
 
 // ---- 濾波 / 校正參數 ----
-let alpha = 0.98;                       // 互補濾波係數(陀螺權重)
-$('alpha').addEventListener('input', e => {
-  alpha = parseFloat(e.target.value);
-  $('alphaVal').textContent = alpha.toFixed(3);
+let tau = 20;                           // 重力修正時間常數(秒):姿態被拉向加速計「上」的速度
+$('tau').addEventListener('input', e => {
+  tau = parseFloat(e.target.value);
+  $('tauVal').textContent = tau + ' s';
 });
 
 // ZUPT(零速修正)開關
@@ -448,9 +448,9 @@ function onMotion(ev) {
   }
   q = qNorm(qMul(q, dq));   // 陀螺預測(body 系右乘)
 
-  // 加速計重力修正(只在加速度接近 1g 時採信,排除劇烈運動污染)
+  // 加速計重力修正(只在加速度大小接近 1g 時採信)
   const agMag = Math.hypot(ag.x||0, ag.y||0, ag.z||0);
-  if (agMag > 1e-3 && Math.abs(agMag - 9.81) < 4.0) {
+  if (agMag > 1e-3 && Math.abs(agMag - g0) < 2.0) {
     // 量測的重力方向(body 系,指向上方=遠離地心的反向;normalize)
     const mUp = { x:(ag.x||0)/agMag, y:(ag.y||0)/agMag, z:(ag.z||0)/agMag };
     // 由目前姿態預測的世界上方向 [0,0,1] 在 body 系的樣子
@@ -459,7 +459,13 @@ function onMotion(ev) {
     const ex = mUp.y*pUp.z - mUp.z*pUp.y;
     const ey = mUp.z*pUp.x - mUp.x*pUp.z;
     const ez = mUp.x*pUp.y - mUp.y*pUp.x;
-    const gain = (1 - alpha);            // 加速計權重
+    // 增益 = dt/τ(時間常數化,與取樣率無關)。
+    // 運動閘控:自估線性加速度大時(正在推手機)增益再降 10 倍,
+    // 否則持續加速度會被吸進重力方向 → 等效高通 → 減速時軌跡走回頭路。
+    // 注意水平加速度幾乎不改 |ag|(正交於重力),靠大小閘擋不住,必須靠這裡。
+    let gain = dt / tau;
+    if (Math.hypot(lastAWorld.x, lastAWorld.y, lastAWorld.z) > 0.4) gain *= 0.1;
+    gain = Math.min(gain, 0.05);
     // 把小旋轉誤差當作四元數修正右乘進去
     const corr = qNorm({ w:1, x:ex*gain, y:ey*gain, z:ez*gain });
     q = qNorm(qMul(q, corr));
@@ -494,7 +500,7 @@ function onMotion(ev) {
   // 這個殘差會被二次積分放大成假位移 → 提示使用者重新校正。
   const gyroDps = Math.hypot(wx, wy, wz) * 180/Math.PI;
   const aWorldMag = Math.hypot(aWorld.x, aWorld.y, aWorld.z);
-  const quasiStatic = gyroDps < 3 && Math.abs(agMag - 9.81) < 0.6;
+  const quasiStatic = gyroDps < 3 && Math.abs(agMag - g0) < 0.6;
   if (quasiStatic && aWorldMag > 0.35) staticBadCount++; else staticBadCount = 0;
   if (staticBadCount > 100 && !sensorWarned) {   // 約 1.5~2 秒
     sensorWarned = true;
@@ -696,7 +702,7 @@ function exportCSV() {
   const meta = [
     `# device=${navigator.userAgent}`,
     `# start=${sessionStartISO}`,
-    `# alpha=${alpha}`,
+    `# tau_s=${tau}`,
     `# acc_source=${ownAcc ? 'own(includingGravity-attitude_gravity)' : 'os_linear'}`,
     `# g0=${g0.toFixed(4)}`,
     `# bias_accel=${bias.ax.toFixed(5)},${bias.ay.toFixed(5)},${bias.az.toFixed(5)}`,
