@@ -1363,6 +1363,11 @@ btnStop.addEventListener('click', () => { stopRun(); btnExport.disabled = log.le
 btnExport.addEventListener('click', exportCSV);
 btnShare.addEventListener('click', shareCSV);
 
+// 離線快取(機上無網路仍可重載頁面)
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').catch(() => {});
+}
+
 // 初始
 setState(State.IDLE);
 </script>
