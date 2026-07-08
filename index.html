@@ -392,6 +392,7 @@ let velAlt = { x:0, y:0, z:0 };
 // 速率輔助 DR(GPS 模擬輪速計):航向=陀螺世界系積分、速率=GPS 都卜勒
 let posDr = { x:0, y:0 };
 let hdgDr = null;              // 行進航向(rad,world 系);null=尚未鎖定初始方向
+let vOdoHold = 0;              // 最後已知 GPS 速度(斷訊時惰行用)
 let att = { roll:0, pitch:0, yaw:0 };
 let lastABody = { x:0, y:0, z:0 };   // 最新扣零偏後 body 加速度(診斷顯示用)
 let lastAWorld = { x:0, y:0, z:0 };  // 最新世界系加速度(診斷顯示用)
@@ -741,9 +742,12 @@ function onMotion(ev) {
     }
   } else {
     hdgDr += wWorldZ * dt;
-    const vOdo = ((now - lastGpsWallT) < 3000 && lastGpsSpeed != null) ? lastGpsSpeed : 0;
-    posDr.x += vOdo * Math.cos(hdgDr) * dt;
-    posDr.y += vOdo * Math.sin(hdgDr) * dt;
+    // GPS 斷訊(隧道)→ 維持最後已知速度惰行(coast)。
+    // 真輪速計會持續量測;對火車/高鐵,速度短時間近似不變,惰行是合理模型。
+    // 注意:惰行期間的減速/加速不會被反映——這是「模擬」輪速計的誠實極限。
+    if ((now - lastGpsWallT) < 3000 && lastGpsSpeed != null) vOdoHold = lastGpsSpeed;
+    posDr.x += vOdoHold * Math.cos(hdgDr) * dt;
+    posDr.y += vOdoHold * Math.sin(hdgDr) * dt;
   }
 
   // 另一來源平行積分(同姿態、同 dt,只差加速度來源)
@@ -917,7 +921,7 @@ function startRun() {
   vel = { x:0, y:0, z:0 };
   posAlt = { x:0, y:0, z:0 };
   velAlt = { x:0, y:0, z:0 };
-  posDr = { x:0, y:0 }; hdgDr = null;
+  posDr = { x:0, y:0 }; hdgDr = null; vOdoHold = 0;
   log = []; traj = [{x:0,y:0}]; trajAlt = [{x:0,y:0}]; trajDr = [{x:0,y:0}]; errSeries = []; peakDisp = 0;
   staticBadCount = 0; sensorWarned = false;
   jerkCount = 0; lastAgMagJ = null;
@@ -954,7 +958,7 @@ function resetSession() {
   vel = { x:0, y:0, z:0 };
   posAlt = { x:0, y:0, z:0 };
   velAlt = { x:0, y:0, z:0 };
-  posDr = { x:0, y:0 }; hdgDr = null;
+  posDr = { x:0, y:0 }; hdgDr = null; vOdoHold = 0;
   elapsed = 0; peakDisp = 0;
   log = []; traj = []; trajAlt = []; trajDr = []; errSeries = [];
   staticBadCount = 0; sensorWarned = false;
