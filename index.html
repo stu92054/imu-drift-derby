@@ -328,7 +328,8 @@ function onGpsFix(p) {
   if (gpsTraj.length > 4000) gpsTraj.shift();
   if (gpsErrSeries.length > 4000) gpsErrSeries.shift();
   gpsFixCount++;
-  gpsLatest = { lat, lon, accuracy, speed: p.coords.speed, consumed: false };
+  gpsLatest = { lat, lon, accuracy, speed: p.coords.speed,
+                alt: p.coords.altitude, consumed: false };  // altitude 室外才有,可為 null
   // 方位對齊(單次鎖定):IMU 無磁力計,世界系 yaw 任意;
   // 等兩軌都走出 >15 m,用初期位移方向差把 GPS 轉進 IMU 系(初期 IMU 最可信)
   if (gpsAlign === null) {
@@ -748,8 +749,9 @@ function onMotion(ev) {
       ? (gpsLatest.consumed = true,
          [gpsLatest.lat.toFixed(7), gpsLatest.lon.toFixed(7),
           gpsLatest.accuracy.toFixed(1),
-          gpsLatest.speed != null ? gpsLatest.speed.toFixed(2) : ''])
-      : ['', '', '', ''])
+          gpsLatest.speed != null ? gpsLatest.speed.toFixed(2) : '',
+          gpsLatest.alt != null ? gpsLatest.alt.toFixed(1) : ''])
+      : ['', '', '', '', ''])
   ]);
 
   // --- 軌跡 / 誤差序列(降採樣以免爆記憶體)---
@@ -927,7 +929,7 @@ function buildCSV() {
     'roll_deg','pitch_deg','yaw_deg',
     'px_alt','py_alt','pz_alt',
     'mag_hdg_deg',
-    'gps_lat','gps_lon','gps_acc_m','gps_speed'
+    'gps_lat','gps_lon','gps_acc_m','gps_speed','gps_alt_m'
   ].join(',');
   const body = log.map(r => r.join(',')).join('\n');
   // 檔頭附上 metadata 註解(以 # 開頭,分析時可略過)
