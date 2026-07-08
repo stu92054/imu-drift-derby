@@ -130,6 +130,7 @@
 
 <!-- 控制按鈕 -->
 <div class="card">
+  <button class="btn secondary" id="btnWarm">⓪ GPS / 羅盤暖機(戶外建議)</button>
   <button class="btn warn" id="btnCalib">① 開始校正(靜置 5 秒)</button>
   <button class="btn" id="btnStart" disabled>② 開始量測</button>
   <button class="btn danger" id="btnStop" disabled>③ 停止</button>
@@ -170,6 +171,18 @@
     <div class="r"><span>gyro 均值 (deg/s)</span><span id="cGyr">--</span></div>
     <div class="r"><span>已收集樣本</span><span id="cN">0</span></div>
   </div>
+</div>
+
+<!-- 暖機面板 -->
+<div class="card hidden" id="warmCard">
+  <h2>GPS / 羅盤暖機中</h2>
+  <div class="live-rows">
+    <div class="r"><span>GPS 精度</span><span id="wAcc">--</span></div>
+    <div class="r"><span>GPS 原點</span><span id="wOrigin">未鎖定</span></div>
+    <div class="r"><span>羅盤航向</span><span id="wHdg">--</span></div>
+    <div class="r"><span>羅盤穩定度(3 秒窗)</span><span id="wJit">--</span></div>
+  </div>
+  <div class="subtitle" style="margin-top:8px">站在起點:① 等 GPS 原點鎖定(三星可到 ±3~5m;iPhone ±15m 已是極限)② 手機水平畫「8 字」讓 OS 校磁,直到穩定度 &lt; ±3°。之後照常「① 開始校正」→「② 開始量測」,量測起點會沿用暖機好的 GPS。</div>
 </div>
 
 <!-- 軌跡圖 -->
@@ -269,6 +282,24 @@ const statusEl = $('status');
 const badge = $('stateBadge');
 const timerBar = $('timerBar'), timerVal = $('timerVal'), timerLbl = $('timerLbl');
 const btnCalib = $('btnCalib'), btnStart = $('btnStart'), btnStop = $('btnStop'), btnExport = $('btnExport'), btnShare = $('btnShare');
+const btnWarm = $('btnWarm'), warmCard = $('warmCard');
+let warmupOn = false;
+
+// ⓪ GPS/羅盤暖機:鎖 GPS 原點 + OS 磁力計校正(畫 8 字),達標再進正式流程
+btnWarm.addEventListener('click', async () => {
+  const ok = await requestSensorPermission();
+  if (!ok) return;
+  attachOrient();
+  warmupOn = true;
+  warmCard.classList.remove('hidden');
+  if (gpsEnabled && 'geolocation' in navigator && gpsWatchId === null) {
+    gpsOrigin = null; gpsFixCount = 0;
+    gpsWatchId = navigator.geolocation.watchPosition(onGpsFix, onGpsErr,
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+  }
+  setStatus('暖機中:站在起點等 GPS 原點鎖定,並拿手機畫 8 字校羅盤。', 'ok');
+  requestWakeLock();
+});
 const hzView = $('hzView');
 const calibCard = $('calibCard');
 
@@ -336,6 +367,7 @@ function onGpsFix(p) {
     if (accuracy > 20) return;
     gpsOrigin = { lat, lon };
   }
+  if (state !== State.RUN) return;   // 暖機/待命期間只鎖原點,不記軌跡
   // 經緯度 → 局部 ENU 平面(等距圓柱近似,數公里內誤差可忽略)
   const x = (lon - gpsOrigin.lon) * Math.cos(gpsOrigin.lat * Math.PI/180) * 111320;
   const y = (lat - gpsOrigin.lat) * 110540;
@@ -360,10 +392,20 @@ function onGpsErr(e) {
 }
 function startGps() {
   if (!gpsEnabled || !('geolocation' in navigator)) return;
-  gpsOrigin = null; gpsTraj = []; gpsErrSeries = []; gpsLatest = null;
-  gpsFixCount = 0; gpsPathLen = 0; gpsLastPt = null; gpsAlign = null;
-  gpsWatchId = navigator.geolocation.watchPosition(onGpsFix, onGpsErr,
-    { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+  gpsTraj = []; gpsErrSeries = [];
+  gpsPathLen = 0; gpsLastPt = null; gpsAlign = null;
+  if (gpsWatchId !== null && gpsLatest && gpsLatest.accuracy <= 20 &&
+      (performance.now() - lastGpsWallT) < 5000) {
+    // 已暖機:沿用熱的 watch,原點重錨到最近的良好 fix(= 量測起點)
+    gpsOrigin = { lat: gpsLatest.lat, lon: gpsLatest.lon };
+  } else {
+    gpsOrigin = null;
+    gpsFixCount = 0;
+    if (gpsWatchId === null) {
+      gpsWatchId = navigator.geolocation.watchPosition(onGpsFix, onGpsErr,
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+    }
+  }
 }
 function stopGps() {
   if (gpsWatchId !== null) { navigator.geolocation.clearWatch(gpsWatchId); gpsWatchId = null; }
@@ -493,6 +535,7 @@ let magHeading = null;      // 最新羅盤航向(deg,順時針自磁北)
 let magAccuracy = null;     // iOS 提供的精度估計(deg)
 let magT = 0;
 let orientEvtSeen = false;  // 有沒有收到任何 orientation 事件(診斷用)
+let magBuf = [];            // 近期羅盤讀值 {t,h}(暖機穩定度計算用)
 function onOrient(ev) {
   orientEvtSeen = true;
   let h = null;
@@ -502,7 +545,11 @@ function onOrient(ev) {
   } else if (ev.absolute === true && ev.alpha != null) {
     h = (360 - ev.alpha) % 360;                  // Android absolute:alpha 逆時針 → 航向順時針
   }
-  if (h != null) { magHeading = h; magT = performance.now(); }
+  if (h != null) {
+    magHeading = h; magT = performance.now();
+    magBuf.push({ t: magT, h });
+    if (magBuf.length > 400) magBuf.shift();
+  }
 }
 // 兩種事件都聽(部分裝置只發其中一種;handler 自行篩選 absolute)
 function attachOrient() {
@@ -931,6 +978,8 @@ function startRun() {
   window.addEventListener('devicemotion', onMotion);  // STOPPED 重新開始時需重掛(重複掛同函式無害)
   startGps();
 
+  warmupOn = false;
+  warmCard.classList.add('hidden');
   setState(State.RUN);
   setStatus('量測中:無 ZUPT 修正,觀察位置誤差隨 t² 增長。', 'ok');
   timerBar.style.display = 'block';
@@ -1291,6 +1340,29 @@ function updatePanel() {
   }
   $('zuptState').textContent = zuptEnabled ? (zuptActiveNow ? 'ON·觸發中' : 'ON') : 'OFF';
   $('ownAccState').textContent = ownAcc ? '自算' : 'OS';
+  // 暖機面板
+  if (warmupOn) {
+    $('wAcc').textContent = gpsFixCount ? '±' + gpsAccuracy.toFixed(0) + ' m(' + gpsFixCount + ' fixes)' : (gpsEnabled ? '搜星中…' : 'GPS OFF');
+    $('wOrigin').textContent = gpsOrigin ? '已鎖定 ✓' : '未鎖定(等精度 ≤20m)';
+    $('wHdg').textContent = magHeading != null ? magHeading.toFixed(0) + '°' : '--';
+    const cut = performance.now() - 3000;
+    const hs = magBuf.filter(b => b.t > cut);
+    if (hs.length > 5) {
+      let sx = 0, sy = 0;
+      for (const b of hs) { sx += Math.cos(b.h * Math.PI/180); sy += Math.sin(b.h * Math.PI/180); }
+      const mean = Math.atan2(sy, sx);
+      let maxDev = 0;
+      for (const b of hs) {
+        let d = b.h * Math.PI/180 - mean;
+        while (d > Math.PI) d -= 2*Math.PI; while (d < -Math.PI) d += 2*Math.PI;
+        maxDev = Math.max(maxDev, Math.abs(d));
+      }
+      const deg = maxDev * 180/Math.PI;
+      $('wJit').textContent = '±' + deg.toFixed(1) + '°' + (deg < 3 ? ' ✓' : '(畫 8 字校正)');
+    } else {
+      $('wJit').textContent = '--';
+    }
+  }
   $('magState').textContent = magHeading == null
     ? (orientEvtSeen ? '有事件·無航向(瀏覽器不支援)'
                      : (magEnabled ? 'ON·' : '') + '等待感測器(先按①授權)')
@@ -1362,6 +1434,7 @@ function setState(s) {
   const map = { idle:'待命', calib:'校正中', ready:'已校正', run:'量測中', stopped:'已停止' };
   badge.textContent = map[s] || s;
   btnCalib.disabled  = (s === State.CALIB || s === State.RUN);
+  btnWarm.disabled   = (s === State.CALIB || s === State.RUN);
   btnStart.disabled  = !(s === State.READY || s === State.STOPPED);
   btnStop.disabled   = (s !== State.RUN);
   btnExport.disabled = !(s === State.STOPPED) || log.length === 0;
