@@ -356,10 +356,11 @@ let lastGpsCourse = null, lastGpsCourseT = 0;   // 航跡向(deg,順時針自真
 let ghSign = loadSign('ghSign'), ghCorrAcc = 0, ghPrev = null, ghOffset = null;  // yaw 修正:符號學習+偏移鎖定
 let drCrsOffset = null;                          // DR 航向 vs course 的偏移鎖定
 let drCrsSign = loadSign('drCrsSign'), drCrsCorr = 0, drCrsPrev = null;  // DR 符號也從資料學(勿寫死)
-let drGateT = 0;                                 // DR 錨定被閘在外的起始時間(重捕獲)
+let drGateT = 0, ghGateT = 0, magGateT = 0;      // 各錨定被閘在外的起始時間(重捕獲)
 function resetGpsHdg() {
   ghSign = loadSign('ghSign'); ghCorrAcc = 0; ghPrev = null; ghOffset = null;
-  drCrsOffset = null; drCrsSign = loadSign('drCrsSign'); drCrsCorr = 0; drCrsPrev = null; drGateT = 0;
+  drCrsOffset = null; drCrsSign = loadSign('drCrsSign'); drCrsCorr = 0; drCrsPrev = null;
+  drGateT = 0; ghGateT = 0;
 }
 $('gpsHdgChk').addEventListener('change', e => {
   gpsHdgEnabled = e.target.checked;
@@ -466,9 +467,12 @@ let vel = { x:0, y:0, z:0 };   // 速度 (m/s)
 let posAlt = { x:0, y:0, z:0 };// 另一來源平行積分(自算/OS 對比,同一次量測兩種答案)
 let velAlt = { x:0, y:0, z:0 };
 // 速率輔助 DR(GPS 模擬輪速計):航向=陀螺世界系積分、速率=GPS 都卜勒
-let posDr = { x:0, y:0 };
-let hdgDr = null;              // 行進航向(rad,world 系);null=尚未鎖定初始方向
+let posDr = { x:0, y:0 };      // 注意:DR 現在活在「北朝上」座標系(課程錨定後為絕對方位)
+let hdgDr = null;              // 行進航向(math 角,北朝上系);null=尚未鎖定
+let hdgRawDr = 0;              // 未定符號的原始積分(符號學習用)
 let vOdoHold = 0;              // 最後已知 GPS 速度(斷訊時惰行用)
+let upLP = { x:0, y:0, z:0 };  // body 系「上」= 加速計低通。DR 航向率 = ω·upLP,
+                               // 繞過姿態管線——傾角估計錯誤不會把旋轉投丟(公園實測教訓)
 let att = { roll:0, pitch:0, yaw:0 };
 let lastABody = { x:0, y:0, z:0 };   // 最新扣零偏後 body 加速度(診斷顯示用)
 let lastAWorld = { x:0, y:0, z:0 };  // 最新世界系加速度(診斷顯示用)
@@ -763,6 +767,11 @@ function onMotion(ev) {
           const half = err * Math.PI/180 * g / 2;
           // 世界系繞 Z 的小旋轉,左乘(不影響重力方向,只轉航向)
           q = qNorm(qMul({ w: Math.cos(half), x: 0, y: 0, z: Math.sin(half) }, q));
+          magGateT = 0;
+        } else {
+          // 重捕獲:被閘在外連續 3s → 重新鎖定偏移(有閘門就必須有重捕獲)
+          if (!magGateT) magGateT = now;
+          else if (now - magGateT > 3000) { magYawOffset = null; magGateT = 0; }
         }
       }
     }
@@ -801,6 +810,11 @@ function onMotion(ev) {
           const g = Math.min(dt / 10, 0.05);   // τ=10s(course 品質優於磁羅盤)
           const half = err * Math.PI/180 * g / 2;
           q = qNorm(qMul({ w: Math.cos(half), x: 0, y: 0, z: Math.sin(half) }, q));
+          ghGateT = 0;
+        } else {
+          // 重捕獲:被閘在外連續 3s → 重新鎖定偏移(有閘門就必須有重捕獲)
+          if (!ghGateT) ghGateT = now;
+          else if (now - ghGateT > 3000) { ghOffset = null; ghGateT = 0; }
         }
       }
     }
@@ -854,65 +868,66 @@ function onMotion(ev) {
   pos.z += (vel.z + nvz) * 0.5 * dt;
   vel.x = nvx; vel.y = nvy; vel.z = nvz;
   /* ---- 速率輔助 DR(GPS 模擬輪速計)----
-     位置不做二次積分:航向來自陀螺(世界系垂直角速度積分,與安裝方向無關)、
-     速率借 GPS 都卜勒(誤差有界 ≈ 輪速計)。兩個有界誤差相乘 → 誤差線性增長,
-     不再 t² 爆炸;轉彎直接反映在航向上,不會被灌水的速度向量稀釋。 */
-  const wWorldZ = qRotate(q, { x:wx, y:wy, z:wz }).z;   // 世界系偏航角速度 rad/s
-  if (hdgDr === null) {
-    // 初始行進方向:GPS 確認真的在動之後,從 INS 速度方向一次鎖定(初期最可信)
-    // 門檻 1.2 m/s:涵蓋快走(~1.4)與車輛,又高於 GPS 靜止時的速度噪聲
-    if (lastGpsSpeed != null && lastGpsSpeed > 1.2 && Math.hypot(vel.x, vel.y) > 0.5) {
-      hdgDr = Math.atan2(vel.y, vel.x);
+     航向率 = ω 投影到「上」方向(加速計低通)——繞過姿態管線,傾角估計錯誤
+     不會把旋轉投丟(公園實測:姿態以為平放、實際直立,yaw 全數蒸發)。
+     航向以 GPS 課程錨定 → DR 活在北朝上絕對座標系;符號從資料學並持久化。
+     速率借 GPS 都卜勒(誤差有界 ≈ 輪速計)→ 誤差線性增長,不再 t² 爆炸。 */
+  if (ag.x != null) {
+    const am = Math.hypot(ag.x||0, ag.y||0, ag.z||0) || 1;
+    if (upLP.x === 0 && upLP.y === 0 && upLP.z === 0) {
+      upLP = { x:(ag.x||0)/am, y:(ag.y||0)/am, z:(ag.z||0)/am };
+    } else {
+      const ku = Math.min(dt/2, 0.2);
+      upLP.x += ((ag.x||0)/am - upLP.x) * ku;
+      upLP.y += ((ag.y||0)/am - upLP.y) * ku;
+      upLP.z += ((ag.z||0)/am - upLP.z) * ku;
     }
-  } else {
-    hdgDr += wWorldZ * dt;
-    // GPS 航跡向錨定 DR 航向(τ=10s)。符號從資料學(陀螺慣例被證實與規格相反,
-    // 寫死符號會跟真實旋轉打架);閘門配硬重置重捕獲(重播實測教訓)。
-    if (gpsHdgEnabled && lastGpsCourse != null && (now - lastGpsCourseT) < 3000) {
-      const crsRad = lastGpsCourse * Math.PI/180;
-      // 符號學習:每個新 fix 取樣一次
-      if (!drCrsPrev || drCrsPrev.ct !== lastGpsCourseT) {
-        if (drCrsPrev) {
-          const dH = hdgDr - drCrsPrev.h;
-          let dC = crsRad - drCrsPrev.c;
-          while (dC > Math.PI) dC -= 2*Math.PI; while (dC < -Math.PI) dC += 2*Math.PI;
-          drCrsCorr += dH * dC;
-          if (drCrsSign === 0 && Math.abs(drCrsCorr) > 0.06) {
-            drCrsSign = drCrsCorr > 0 ? 1 : -1;
-            saveSign('drCrsSign', drCrsSign);
-          } else if (drCrsSign !== 0 && drCrsCorr * drCrsSign < -0.18) {
-            drCrsSign = -drCrsSign; saveSign('drCrsSign', drCrsSign);
-            drCrsOffset = null; drCrsCorr = 0;
-          }
-        }
-        drCrsPrev = { h: hdgDr, c: crsRad, ct: lastGpsCourseT };
+  }
+  const unLP = Math.hypot(upLP.x, upLP.y, upLP.z) || 1;
+  const wUp = (wx*upLP.x + wy*upLP.y + wz*upLP.z) / unLP;   // rad/s,符號=瀏覽器慣例(由學習吸收)
+  hdgRawDr += wUp * dt;
+  const crsFresh = lastGpsCourse != null && (now - lastGpsCourseT) < 3000;
+  const crsMath = crsFresh ? (90 - lastGpsCourse) * Math.PI/180 : null;  // 課程→北朝上 math 角
+  // 符號學習:每個新 fix 取樣一次(逐樣本會稀釋相關量——重播實測教訓)
+  if (crsFresh && (!drCrsPrev || drCrsPrev.ct !== lastGpsCourseT)) {
+    if (drCrsPrev) {
+      const dH = hdgRawDr - drCrsPrev.h;
+      let dC = crsMath - drCrsPrev.c;
+      while (dC > Math.PI) dC -= 2*Math.PI; while (dC < -Math.PI) dC += 2*Math.PI;
+      drCrsCorr += dH * dC;
+      if (drCrsSign === 0 && Math.abs(drCrsCorr) > 0.06) {
+        drCrsSign = drCrsCorr > 0 ? 1 : -1;
+        saveSign('drCrsSign', drCrsSign);
+      } else if (drCrsSign !== 0 && drCrsCorr * drCrsSign < -0.18) {
+        drCrsSign = -drCrsSign; saveSign('drCrsSign', drCrsSign);
+        hdgDr = null; drCrsCorr = 0;   // 符號翻轉:航向重新鎖定
       }
-      if (drCrsSign !== 0) {
-        if (drCrsOffset === null) {
-          drCrsOffset = hdgDr - drCrsSign * crsRad;
+    }
+    drCrsPrev = { h: hdgRawDr, c: crsMath, ct: lastGpsCourseT };
+  }
+  if (drCrsSign !== 0 && gpsHdgEnabled) {
+    if (hdgDr === null) {
+      if (crsFresh) hdgDr = crsMath;   // 初始航向直接取課程(北參考)
+    } else {
+      hdgDr += drCrsSign * wUp * dt;
+      if (crsFresh) {
+        let e = crsMath - hdgDr;
+        while (e > Math.PI) e -= 2*Math.PI; while (e < -Math.PI) e += 2*Math.PI;
+        if (Math.abs(e) < Math.PI/4) {
+          hdgDr += e * Math.min(dt / 10, 0.05);
+          drGateT = 0;
         } else {
-          let e = (drCrsOffset + drCrsSign * crsRad) - hdgDr;
-          while (e > Math.PI) e -= 2*Math.PI; while (e < -Math.PI) e += 2*Math.PI;
-          if (Math.abs(e) < Math.PI/4) {
-            hdgDr += e * Math.min(dt / 10, 0.05);
-            drGateT = 0;
-          } else {
-            // 重捕獲:被閘在外連續 3s → 硬重置(course 品質已由速度條件保證)
-            if (!drGateT) drGateT = now;
-            else if (now - drGateT > 3000) {
-              hdgDr = drCrsOffset + drCrsSign * crsRad;
-              drGateT = 0;
-            }
-          }
+          // 重捕獲:被閘在外連續 3s → 硬重置(課程品質已由速度條件保證)
+          if (!drGateT) drGateT = now;
+          else if (now - drGateT > 3000) { hdgDr = crsMath; drGateT = 0; }
         }
       }
+      // GPS 斷訊(隧道)→ 維持最後已知速度惰行(coast)。
+      // 真輪速計會持續量測;對火車/高鐵,速度短時間近似不變,惰行是合理模型。
+      if ((now - lastGpsWallT) < 3000 && lastGpsSpeed != null) vOdoHold = lastGpsSpeed;
+      posDr.x += vOdoHold * Math.cos(hdgDr) * dt;
+      posDr.y += vOdoHold * Math.sin(hdgDr) * dt;
     }
-    // GPS 斷訊(隧道)→ 維持最後已知速度惰行(coast)。
-    // 真輪速計會持續量測;對火車/高鐵,速度短時間近似不變,惰行是合理模型。
-    // 注意:惰行期間的減速/加速不會被反映——這是「模擬」輪速計的誠實極限。
-    if ((now - lastGpsWallT) < 3000 && lastGpsSpeed != null) vOdoHold = lastGpsSpeed;
-    posDr.x += vOdoHold * Math.cos(hdgDr) * dt;
-    posDr.y += vOdoHold * Math.sin(hdgDr) * dt;
   }
 
   // 另一來源平行積分(同姿態、同 dt,只差加速度來源)
@@ -1087,7 +1102,7 @@ function startRun() {
   vel = { x:0, y:0, z:0 };
   posAlt = { x:0, y:0, z:0 };
   velAlt = { x:0, y:0, z:0 };
-  posDr = { x:0, y:0 }; hdgDr = null; vOdoHold = 0;
+  posDr = { x:0, y:0 }; hdgDr = null; hdgRawDr = 0; vOdoHold = 0; upLP = { x:0, y:0, z:0 };
   log = []; traj = [{x:0,y:0}]; trajAlt = [{x:0,y:0}]; trajDr = [{x:0,y:0}]; errSeries = []; peakDisp = 0;
   staticBadCount = 0; sensorWarned = false;
   jerkCount = 0; lastAgMagJ = null;
@@ -1126,7 +1141,7 @@ function resetSession() {
   vel = { x:0, y:0, z:0 };
   posAlt = { x:0, y:0, z:0 };
   velAlt = { x:0, y:0, z:0 };
-  posDr = { x:0, y:0 }; hdgDr = null; vOdoHold = 0;
+  posDr = { x:0, y:0 }; hdgDr = null; hdgRawDr = 0; vOdoHold = 0; upLP = { x:0, y:0, z:0 };
   elapsed = 0; peakDisp = 0;
   log = []; traj = []; trajAlt = []; trajDr = []; errSeries = [];
   staticBadCount = 0; sensorWarned = false;
@@ -1292,13 +1307,15 @@ function drawTrajectory() {
   const ga = gpsAlign !== null ? gpsAlign : 0;
   const gc = Math.cos(ga), gs = Math.sin(ga);
   const gpsPts = gpsTraj.map(p => ({ x: p.x*gc - p.y*gs, y: p.x*gs + p.y*gc }));
+  // DR 也在北朝上系,同樣旋轉進 IMU 畫布座標
+  const drPts = trajDr.map(p => ({ x: p.x*gc - p.y*gs, y: p.x*gs + p.y*gc }));
 
   // 依目前最大範圍自動縮放(三軌都納入)
   let maxR = 0.5;
   for (const p of traj) maxR = Math.max(maxR, Math.abs(p.x), Math.abs(p.y));
   for (const p of trajAlt) maxR = Math.max(maxR, Math.abs(p.x), Math.abs(p.y));
   for (const p of gpsPts) maxR = Math.max(maxR, Math.abs(p.x), Math.abs(p.y));
-  for (const p of trajDr) maxR = Math.max(maxR, Math.abs(p.x), Math.abs(p.y));
+  for (const p of drPts) maxR = Math.max(maxR, Math.abs(p.x), Math.abs(p.y));
   maxR = Math.max(maxR, Math.abs(pos.x), Math.abs(pos.y));
   maxR *= 1.15;                                   // 邊界留白
   const half = Math.min(w, h)/2 - 8;
@@ -1336,14 +1353,14 @@ function drawTrajectory() {
     ctx.stroke();
     ctx.globalAlpha = 1;
   }
-  // 速率輔助 DR 軌(紫:陀螺航向 × GPS 速率)
-  if (trajDr.length > 1) {
+  // 速率輔助 DR 軌(紫:陀螺航向 × GPS 速率;北系旋轉進畫布)
+  if (drPts.length > 1) {
     ctx.strokeStyle = '#c792ea'; ctx.lineWidth = 2;
     ctx.setLineDash([7, 5]);
     ctx.beginPath();
-    for (let i = 0; i < trajDr.length; i++) {
-      const px = cx + trajDr[i].x * ppm;
-      const py = cy - trajDr[i].y * ppm;
+    for (let i = 0; i < drPts.length; i++) {
+      const px = cx + drPts[i].x * ppm;
+      const py = cy - drPts[i].y * ppm;
       if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
     }
     ctx.stroke();
