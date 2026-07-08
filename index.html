@@ -350,7 +350,12 @@ let gpsHdgEnabled = false;
 let lastGpsCourse = null, lastGpsCourseT = 0;   // 航跡向(deg,順時針自真北)
 let ghSign = 0, ghCorrAcc = 0, ghPrev = null, ghOffset = null;  // yaw 修正:符號學習+偏移鎖定
 let drCrsOffset = null;                          // DR 航向 vs course 的偏移鎖定
-function resetGpsHdg() { ghSign = 0; ghCorrAcc = 0; ghPrev = null; ghOffset = null; drCrsOffset = null; }
+let drCrsSign = 0, drCrsCorr = 0, drCrsPrev = null;  // DR 符號也從資料學(勿寫死——陀螺慣例被證實與規格相反)
+let drGateT = 0;                                 // DR 錨定被閘在外的起始時間(重捕獲)
+function resetGpsHdg() {
+  ghSign = 0; ghCorrAcc = 0; ghPrev = null; ghOffset = null;
+  drCrsOffset = null; drCrsSign = 0; drCrsCorr = 0; drCrsPrev = null; drGateT = 0;
+}
 $('gpsHdgChk').addEventListener('change', e => {
   gpsHdgEnabled = e.target.checked;
   if (!gpsHdgEnabled) resetGpsHdg();
@@ -758,17 +763,20 @@ function onMotion(ev) {
      偏移鎖定吸收手機安裝角與世界系任意朝向;45° 異常閘防低品質 course 亂拉。 */
   if (gpsHdgEnabled && lastGpsCourse != null && (now - lastGpsCourseT) < 3000) {
     const yawDeg2 = qToEuler(q).yaw * 180/Math.PI;
-    if (ghPrev) {
-      let dy = yawDeg2 - ghPrev.yaw;
-      while (dy > 180) dy -= 360; while (dy < -180) dy += 360;
-      let dc = lastGpsCourse - ghPrev.crs;
-      while (dc > 180) dc -= 360; while (dc < -180) dc += 360;
-      if (ghSign === 0) {
-        ghCorrAcc += dy * dc;
-        if (Math.abs(ghCorrAcc) > 200) ghSign = ghCorrAcc > 0 ? 1 : -1;
+    // 符號學習只在「新 fix」取樣——逐樣本取樣會把相關量稀釋 ~40 倍(重播實測教訓)
+    if (!ghPrev || ghPrev.ct !== lastGpsCourseT) {
+      if (ghPrev) {
+        let dy = yawDeg2 - ghPrev.yaw;
+        while (dy > 180) dy -= 360; while (dy < -180) dy += 360;
+        let dc = lastGpsCourse - ghPrev.crs;
+        while (dc > 180) dc -= 360; while (dc < -180) dc += 360;
+        if (ghSign === 0) {
+          ghCorrAcc += dy * dc;
+          if (Math.abs(ghCorrAcc) > 200) ghSign = ghCorrAcc > 0 ? 1 : -1;
+        }
       }
+      ghPrev = { yaw: yawDeg2, crs: lastGpsCourse, ct: lastGpsCourseT };
     }
-    ghPrev = { yaw: yawDeg2, crs: lastGpsCourse };
     if (ghSign !== 0) {
       if (ghOffset === null) {
         ghOffset = yawDeg2 - ghSign * lastGpsCourse;
@@ -844,16 +852,39 @@ function onMotion(ev) {
     }
   } else {
     hdgDr += wWorldZ * dt;
-    // GPS 航跡向直接錨定 DR 航向(τ=10s)。
-    // s=−1 是數學必然(非平台慣例):course 順時針增、hdgDr(math 角)逆時針增。
+    // GPS 航跡向錨定 DR 航向(τ=10s)。符號從資料學(陀螺慣例被證實與規格相反,
+    // 寫死符號會跟真實旋轉打架);閘門配硬重置重捕獲(重播實測教訓)。
     if (gpsHdgEnabled && lastGpsCourse != null && (now - lastGpsCourseT) < 3000) {
       const crsRad = lastGpsCourse * Math.PI/180;
-      if (drCrsOffset === null) {
-        drCrsOffset = hdgDr + crsRad;
-      } else {
-        let e = (drCrsOffset - crsRad) - hdgDr;
-        while (e > Math.PI) e -= 2*Math.PI; while (e < -Math.PI) e += 2*Math.PI;
-        if (Math.abs(e) < Math.PI/4) hdgDr += e * Math.min(dt / 10, 0.05);
+      // 符號學習:每個新 fix 取樣一次
+      if (!drCrsPrev || drCrsPrev.ct !== lastGpsCourseT) {
+        if (drCrsPrev && drCrsSign === 0) {
+          const dH = hdgDr - drCrsPrev.h;
+          let dC = crsRad - drCrsPrev.c;
+          while (dC > Math.PI) dC -= 2*Math.PI; while (dC < -Math.PI) dC += 2*Math.PI;
+          drCrsCorr += dH * dC;
+          if (Math.abs(drCrsCorr) > 0.06) drCrsSign = drCrsCorr > 0 ? 1 : -1;
+        }
+        drCrsPrev = { h: hdgDr, c: crsRad, ct: lastGpsCourseT };
+      }
+      if (drCrsSign !== 0) {
+        if (drCrsOffset === null) {
+          drCrsOffset = hdgDr - drCrsSign * crsRad;
+        } else {
+          let e = (drCrsOffset + drCrsSign * crsRad) - hdgDr;
+          while (e > Math.PI) e -= 2*Math.PI; while (e < -Math.PI) e += 2*Math.PI;
+          if (Math.abs(e) < Math.PI/4) {
+            hdgDr += e * Math.min(dt / 10, 0.05);
+            drGateT = 0;
+          } else {
+            // 重捕獲:被閘在外連續 3s → 硬重置(course 品質已由速度條件保證)
+            if (!drGateT) drGateT = now;
+            else if (now - drGateT > 3000) {
+              hdgDr = drCrsOffset + drCrsSign * crsRad;
+              drGateT = 0;
+            }
+          }
+        }
       }
     }
     // GPS 斷訊(隧道)→ 維持最後已知速度惰行(coast)。
