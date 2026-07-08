@@ -715,7 +715,8 @@ function onMotion(ev) {
   const wWorldZ = qRotate(q, { x:wx, y:wy, z:wz }).z;   // 世界系偏航角速度 rad/s
   if (hdgDr === null) {
     // 初始行進方向:GPS 確認真的在動之後,從 INS 速度方向一次鎖定(初期最可信)
-    if (lastGpsSpeed != null && lastGpsSpeed > 1.5 && Math.hypot(vel.x, vel.y) > 0.5) {
+    // 門檻 1.2 m/s:涵蓋快走(~1.4)與車輛,又高於 GPS 靜止時的速度噪聲
+    if (lastGpsSpeed != null && lastGpsSpeed > 1.2 && Math.hypot(vel.x, vel.y) > 0.5) {
       hdgDr = Math.atan2(vel.y, vel.x);
     }
   } else {
