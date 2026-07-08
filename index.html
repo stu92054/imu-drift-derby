@@ -204,7 +204,7 @@
     <input type="checkbox" id="zuptChk" style="width:22px;height:22px;accent-color:var(--accent)">
     <span class="val" id="zuptState" style="min-width:60px">OFF</span>
   </div>
-  <div class="subtitle" style="margin:6px 0 0">儀器層靜止 0.3s → 回溯扣除靜止期間的幻影位移 + 速度歸零 + 線上更新零偏。可在量測中切換,對比開關前後的漂移行為。</div>
+  <div class="subtitle" style="margin:6px 0 0">三段觸發:①儀器靜止(桌面級)②鬆弛靜止(陀螺/加速度「均值」安靜——穿透引擎怠速與手抖;GPS 速度 >0.8 m/s 時否決)③GPS 零速(<0.4 m/s)。觸發後回溯扣除幻影位移 + 速度歸零 + 零偏學習。</div>
   <div class="slider-row" style="margin-top:12px">
     <label>磁力計 yaw 修正</label>
     <input type="checkbox" id="magChk" style="width:22px;height:22px;accent-color:var(--accent)">
@@ -285,6 +285,12 @@ $('tau').addEventListener('input', e => {
 let zuptEnabled = false;
 let stillHold = 0;         // 儀器層靜止偵測連續樣本數(陀螺+|a|,不依賴導航估計)
 let stillStartT = 0;       // 本次靜止開始的時間戳(ZUPT 回溯修正用)
+// 抗震動鬆弛靜止:引擎怠速/手抖是「高頻零均值」干擾,瞬時值狂跳但滑動平均誠實
+let emaG = { x:0, y:0, z:0 };    // 陀螺 EMA(deg/s,τ≈0.7s)
+let emaAW = { x:0, y:0, z:0 };   // 世界系加速度 EMA
+let gyroQuietHold = 0;           // 陀螺均值安靜的連續樣本數
+let looseHold = 0, looseStartT = 0;
+let lastGpsSpeed = null, lastGpsWallT = 0;  // GPS 都卜勒速度(等速巡航否決權)
 let zuptActiveNow = false; // 目前是否觸發中(UI 顯示用)
 $('zuptChk').addEventListener('change', e => { zuptEnabled = e.target.checked; });
 
@@ -330,6 +336,8 @@ function onGpsFix(p) {
   gpsFixCount++;
   gpsLatest = { lat, lon, accuracy, speed: p.coords.speed,
                 alt: p.coords.altitude, consumed: false };  // altitude 室外才有,可為 null
+  lastGpsSpeed = p.coords.speed;          // 都卜勒速度(可為 null)
+  lastGpsWallT = performance.now();
   // 方位對齊(單次鎖定):IMU 無磁力計,世界系 yaw 任意;
   // 等兩軌都走出 >15 m,用初期位移方向差把 GPS 轉進 IMU 系(初期 IMU 最可信)
   if (gpsAlign === null) {
@@ -568,6 +576,17 @@ function onMotion(ev) {
 
   if (stillNow) { stillHold++; if (stillHold === 1) stillStartT = now; } else stillHold = 0;
   const isStill = stillHold >= 20;   // 持續 ~0.2–0.3 s 才算靜止
+
+  // --- 陀螺均值安靜(抗震動)---
+  // 怠速震動瞬時可達數十 deg/s 但均值≈0;真旋轉才會在 EMA 留下痕跡
+  const ka = Math.min(dt / 0.7, 0.2);
+  emaG.x += (wx*180/Math.PI - emaG.x) * ka;
+  emaG.y += (wy*180/Math.PI - emaG.y) * ka;
+  emaG.z += (wz*180/Math.PI - emaG.z) * ka;
+  const gyroQuietNow = Math.hypot(emaG.x, emaG.y, emaG.z) < 2;
+  if (gyroQuietNow) gyroQuietHold++; else gyroQuietHold = 0;
+  const gyroQuiet = gyroQuietHold >= 60;   // 持續 ~1s
+
   let corrGain = 0;                  // 本樣本實際使用的重力修正增益(log 用)
 
   // 加速計重力修正(只在加速度大小接近 1g 時採信)
@@ -585,7 +604,9 @@ function onMotion(ev) {
     // 運動中 → 慢 τ,且自估線性加速度大時再降 10 倍,避免持續加速度被吸進重力
     //(等效高通 → 減速時走回頭路)。水平加速度幾乎不改 |ag|,大小閘擋不住,必須靠這裡。
     let gain;
-    if (isStill) {
+    if (isStill || gyroQuiet) {
+      // 陀螺均值安靜就允許快速再錨定:震動下重力方向的「平均」仍可信,
+      // 且必須先修回姿態、假加速度才會消退,鬆弛 ZUPT 才進得來(避免互相等待)
       gain = dt / 2;
     } else {
       gain = dt / tau;
@@ -690,17 +711,31 @@ function onMotion(ev) {
   posAlt.z += (velAlt.z + nvaz) * 0.5 * dt;
   velAlt.x = nvax; velAlt.y = nvay; velAlt.z = nvaz;
 
-  /* ===================== ZUPT 零速修正(可選)=====================
-     儀器層確認靜止(isStill,~0.3s)→ 此刻真實速度應為 0:
-     1) 回溯修正:從「靜止開始」到現在,手機物理上沒動,這段時間用幽靈速度
-        積出來的位移是幻影,可以精確扣掉(不是猜測——儀器層靜止是硬證據)。
-     2) 把積分速度強制歸零(殺掉速度誤差,位置誤差從 t² 降為分段線性)。
-     3) 靜止時 body 加速度殘差就是零偏估計誤差,用 EMA 緩慢吸收進零偏。
-     注意:|a|≈g 是必要非充分條件——等速運動也滿足,會被誤判為靜止。 */
-  if (zuptEnabled && isStill) {
+  /* ===================== ZUPT 零速修正(可選,三段觸發)=====================
+     A) 儀器靜止(isStill):瞬時陀螺+|a| 都安靜——桌面等級的硬證據。
+     B) 鬆弛靜止(looseStill):陀螺「均值」安靜 + 世界加速度「均值」小,
+        穿透引擎怠速/手抖這類高頻零均值干擾;等速巡航也長這樣,
+        故 GPS 都卜勒速度 > 0.8 m/s 時行使否決權。
+     C) GPS 零速(gpsStill):速度 < 0.4 m/s 且精度佳——震動污染不了的獨立證據。
+     觸發後:回溯扣除幻影位移(A/B 有可信起點;C 無,只歸零)、速度歸零、
+     零偏 EMA 學習(B/C 用較小增益,震動下殘差較不可信)。 */
+  emaAW.x += (aWorld.x - emaAW.x) * ka;
+  emaAW.y += (aWorld.y - emaAW.y) * ka;
+  emaAW.z += (aWorld.z - emaAW.z) * ka;
+  const gpsFresh = (now - lastGpsWallT) < 3000;
+  const gpsVeto = gpsFresh && lastGpsSpeed != null && lastGpsSpeed > 0.8;
+  const looseNow = gyroQuiet && !gpsVeto
+    && Math.hypot(emaAW.x, emaAW.y, emaAW.z) < 0.4;
+  if (looseNow) { looseHold++; if (looseHold === 1) looseStartT = now; } else looseHold = 0;
+  const looseStill = looseHold >= 60;   // 持續 ~1s
+  const gpsStill = gpsFresh && lastGpsSpeed != null && lastGpsSpeed < 0.4 && gpsAccuracy < 25;
+
+  if (zuptEnabled && (isStill || looseStill || gpsStill)) {
     if (!zuptActiveNow) {
-      // 首次觸發:扣除靜止期間累積的幻影位移(視窗上限 3s 防呆),兩路都修
-      const dtStill = Math.min((now - stillStartT) / 1000, 3);
+      // 首次觸發:扣除靜止期間累積的幻影位移(視窗上限 3s 防呆),兩路都修。
+      // 觸發源優先用起點可信的:嚴格靜止 > 鬆弛靜止 > GPS(無起點,不回溯)
+      const startT = isStill ? stillStartT : (looseStill ? looseStartT : now);
+      const dtStill = Math.min((now - startT) / 1000, 3);
       pos.x -= vel.x * dtStill;
       pos.y -= vel.y * dtStill;
       pos.z -= vel.z * dtStill;
@@ -711,15 +746,16 @@ function onMotion(ev) {
     zuptActiveNow = true;
     vel.x = 0; vel.y = 0; vel.z = 0;
     velAlt.x = 0; velAlt.y = 0; velAlt.z = 0;
-    // 線上零偏學習(body 系):兩路各自用自己的殘差
+    // 線上零偏學習(body 系):兩路各自用自己的殘差;震動下降低增益
+    const lr = isStill ? 0.02 : 0.005;
     if (aBodyOwn) {
-      biasOwn.x += 0.02 * aBodyOwn.x;
-      biasOwn.y += 0.02 * aBodyOwn.y;
-      biasOwn.z += 0.02 * aBodyOwn.z;
+      biasOwn.x += lr * aBodyOwn.x;
+      biasOwn.y += lr * aBodyOwn.y;
+      biasOwn.z += lr * aBodyOwn.z;
     }
-    bias.ax += 0.02 * aBodyOS.x;
-    bias.ay += 0.02 * aBodyOS.y;
-    bias.az += 0.02 * aBodyOS.z;
+    bias.ax += lr * aBodyOS.x;
+    bias.ay += lr * aBodyOS.y;
+    bias.az += lr * aBodyOS.z;
   } else {
     zuptActiveNow = false;
   }
@@ -878,6 +914,9 @@ function resetSession() {
   log = []; traj = []; trajAlt = []; errSeries = [];
   staticBadCount = 0; sensorWarned = false;
   zuptActiveNow = false; stillHold = 0; stillStartT = 0;
+  emaG = { x:0, y:0, z:0 }; emaAW = { x:0, y:0, z:0 };
+  gyroQuietHold = 0; looseHold = 0; looseStartT = 0;
+  lastGpsSpeed = null; lastGpsWallT = 0;
   resetMagLearning();
   lastABody = { x:0, y:0, z:0 }; lastAWorld = { x:0, y:0, z:0 };
 }
