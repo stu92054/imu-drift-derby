@@ -147,6 +147,8 @@
     <div class="stat"><div class="k">另一來源位移</div><div class="v" style="color:var(--accent-2)"><span id="sDispAlt">0.000</span><span class="u"> m</span></div></div>
     <div class="stat"><div class="k">GPS 位移(真值)</div><div class="v" style="color:var(--ok)"><span id="sGps">--</span><span class="u"> m</span></div></div>
     <div class="stat"><div class="k">IMU/GPS 誤差比</div><div class="v"><span id="sErrRatio">--</span></div></div>
+    <div class="stat"><div class="k">速率DR 位移</div><div class="v" style="color:#c792ea"><span id="sDr">--</span><span class="u"> m</span></div></div>
+    <div class="stat"><div class="k">DR/GPS 誤差比</div><div class="v"><span id="sDrRatio">--</span></div></div>
     <div class="stat"><div class="k">Body 線性加速度 |a|</div><div class="v"><span id="sAccB">0.00</span><span class="u"> m/s²</span></div></div>
     <div class="stat"><div class="k">世界系加速度 |a|</div><div class="v"><span id="sAccW">0.00</span><span class="u"> m/s²</span></div></div>
     <div class="stat wide">
@@ -176,7 +178,7 @@
   <canvas id="trajCanvas" width="600" height="600"></canvas>
   <div class="canvas-cap">
     <span>比例尺:<span id="scaleView">-- m/格</span></span>
-    <span>青=主 · 橘=另一來源 · 綠=GPS · 紅點=目前</span>
+    <span>青=主 · 橘=另一來源 · 綠=GPS · 紫虛=速率DR · 紅點=目前</span>
   </div>
 </div>
 
@@ -381,6 +383,9 @@ let pos = { x:0, y:0, z:0 };   // 位置 (m)(主來源)
 let vel = { x:0, y:0, z:0 };   // 速度 (m/s)
 let posAlt = { x:0, y:0, z:0 };// 另一來源平行積分(自算/OS 對比,同一次量測兩種答案)
 let velAlt = { x:0, y:0, z:0 };
+// 速率輔助 DR(GPS 模擬輪速計):航向=陀螺世界系積分、速率=GPS 都卜勒
+let posDr = { x:0, y:0 };
+let hdgDr = null;              // 行進航向(rad,world 系);null=尚未鎖定初始方向
 let att = { roll:0, pitch:0, yaw:0 };
 let lastABody = { x:0, y:0, z:0 };   // 最新扣零偏後 body 加速度(診斷顯示用)
 let lastAWorld = { x:0, y:0, z:0 };  // 最新世界系加速度(診斷顯示用)
@@ -399,6 +404,7 @@ let dtSmoothed = 0;            // 平滑後的 dt(顯示 Hz 用)
 let log = [];                  // 每筆量測樣本
 let traj = [];                 // 軌跡點 {x,y}(繪圖用,降採樣)
 let trajAlt = [];              // 另一來源軌跡
+let trajDr = [];               // 速率輔助 DR 軌跡
 let errSeries = [];            // {t, d} 水平位移-時間
 let peakDisp = 0;
 let sessionStartISO = '';      // 開始量測的 ISO 時間(檔名用)
@@ -702,6 +708,23 @@ function onMotion(ev) {
   pos.y += (vel.y + nvy) * 0.5 * dt;
   pos.z += (vel.z + nvz) * 0.5 * dt;
   vel.x = nvx; vel.y = nvy; vel.z = nvz;
+  /* ---- 速率輔助 DR(GPS 模擬輪速計)----
+     位置不做二次積分:航向來自陀螺(世界系垂直角速度積分,與安裝方向無關)、
+     速率借 GPS 都卜勒(誤差有界 ≈ 輪速計)。兩個有界誤差相乘 → 誤差線性增長,
+     不再 t² 爆炸;轉彎直接反映在航向上,不會被灌水的速度向量稀釋。 */
+  const wWorldZ = qRotate(q, { x:wx, y:wy, z:wz }).z;   // 世界系偏航角速度 rad/s
+  if (hdgDr === null) {
+    // 初始行進方向:GPS 確認真的在動之後,從 INS 速度方向一次鎖定(初期最可信)
+    if (lastGpsSpeed != null && lastGpsSpeed > 1.5 && Math.hypot(vel.x, vel.y) > 0.5) {
+      hdgDr = Math.atan2(vel.y, vel.x);
+    }
+  } else {
+    hdgDr += wWorldZ * dt;
+    const vOdo = ((now - lastGpsWallT) < 3000 && lastGpsSpeed != null) ? lastGpsSpeed : 0;
+    posDr.x += vOdo * Math.cos(hdgDr) * dt;
+    posDr.y += vOdo * Math.sin(hdgDr) * dt;
+  }
+
   // 另一來源平行積分(同姿態、同 dt,只差加速度來源)
   const nvax = velAlt.x + aWorldAlt.x * dt;
   const nvay = velAlt.y + aWorldAlt.y * dt;
@@ -779,6 +802,7 @@ function onMotion(ev) {
     q.w.toFixed(6), q.x.toFixed(6), q.y.toFixed(6), q.z.toFixed(6),
     (att.roll*180/Math.PI).toFixed(3), (att.pitch*180/Math.PI).toFixed(3), (att.yaw*180/Math.PI).toFixed(3),
     posAlt.x.toFixed(5), posAlt.y.toFixed(5), posAlt.z.toFixed(5),
+    posDr.x.toFixed(5), posDr.y.toFixed(5),
     magHeading != null ? magHeading.toFixed(1) : '',
     // GPS 稀疏欄位:只在剛收到新 fix 的那筆樣本寫值,其餘留空
     ...(gpsLatest && !gpsLatest.consumed
@@ -796,6 +820,8 @@ function onMotion(ev) {
   if (log.length % 3 === 0) {
     traj.push({ x:pos.x, y:pos.y });
     trajAlt.push({ x:posAlt.x, y:posAlt.y });
+    trajDr.push({ x:posDr.x, y:posDr.y });
+    if (trajDr.length > 4000) trajDr.shift();
     errSeries.push({ t:elapsed, d:hDisp });
     if (traj.length > 4000) traj.shift();
     if (trajAlt.length > 4000) trajAlt.shift();
@@ -874,7 +900,8 @@ function startRun() {
   vel = { x:0, y:0, z:0 };
   posAlt = { x:0, y:0, z:0 };
   velAlt = { x:0, y:0, z:0 };
-  log = []; traj = [{x:0,y:0}]; trajAlt = [{x:0,y:0}]; errSeries = []; peakDisp = 0;
+  posDr = { x:0, y:0 }; hdgDr = null;
+  log = []; traj = [{x:0,y:0}]; trajAlt = [{x:0,y:0}]; trajDr = [{x:0,y:0}]; errSeries = []; peakDisp = 0;
   staticBadCount = 0; sensorWarned = false;
   jerkCount = 0; lastAgMagJ = null;
   runStartT = performance.now();
@@ -910,8 +937,9 @@ function resetSession() {
   vel = { x:0, y:0, z:0 };
   posAlt = { x:0, y:0, z:0 };
   velAlt = { x:0, y:0, z:0 };
+  posDr = { x:0, y:0 }; hdgDr = null;
   elapsed = 0; peakDisp = 0;
-  log = []; traj = []; trajAlt = []; errSeries = [];
+  log = []; traj = []; trajAlt = []; trajDr = []; errSeries = [];
   staticBadCount = 0; sensorWarned = false;
   zuptActiveNow = false; stillHold = 0; stillStartT = 0;
   emaG = { x:0, y:0, z:0 }; emaAW = { x:0, y:0, z:0 };
@@ -967,6 +995,7 @@ function buildCSV() {
     'qw','qx','qy','qz',
     'roll_deg','pitch_deg','yaw_deg',
     'px_alt','py_alt','pz_alt',
+    'px_dr','py_dr',
     'mag_hdg_deg',
     'gps_lat','gps_lon','gps_acc_m','gps_speed','gps_alt_m'
   ].join(',');
@@ -1077,6 +1106,7 @@ function drawTrajectory() {
   for (const p of traj) maxR = Math.max(maxR, Math.abs(p.x), Math.abs(p.y));
   for (const p of trajAlt) maxR = Math.max(maxR, Math.abs(p.x), Math.abs(p.y));
   for (const p of gpsPts) maxR = Math.max(maxR, Math.abs(p.x), Math.abs(p.y));
+  for (const p of trajDr) maxR = Math.max(maxR, Math.abs(p.x), Math.abs(p.y));
   maxR = Math.max(maxR, Math.abs(pos.x), Math.abs(pos.y));
   maxR *= 1.15;                                   // 邊界留白
   const half = Math.min(w, h)/2 - 8;
@@ -1113,6 +1143,19 @@ function drawTrajectory() {
     }
     ctx.stroke();
     ctx.globalAlpha = 1;
+  }
+  // 速率輔助 DR 軌(紫:陀螺航向 × GPS 速率)
+  if (trajDr.length > 1) {
+    ctx.strokeStyle = '#c792ea'; ctx.lineWidth = 2;
+    ctx.setLineDash([7, 5]);
+    ctx.beginPath();
+    for (let i = 0; i < trajDr.length; i++) {
+      const px = cx + trajDr[i].x * ppm;
+      const py = cy - trajDr[i].y * ppm;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
   }
   // 另一來源軌跡(橘,墊底)
   if (trajAlt.length > 1) {
@@ -1239,6 +1282,10 @@ function updatePanel() {
   $('sGps').textContent = gpsFixCount ? gpsNet.toFixed(1) : '--';
   $('sErrRatio').textContent = (gpsNet > 10)
     ? '×' + (Math.hypot(pos.x, pos.y) / gpsNet).toFixed(2) : '--';
+  const drNet = Math.hypot(posDr.x, posDr.y);
+  $('sDr').textContent = hdgDr !== null ? drNet.toFixed(1) : '--';
+  $('sDrRatio').textContent = (hdgDr !== null && gpsNet > 10)
+    ? '×' + (drNet / gpsNet).toFixed(2) : '--';
   $('sAccB').textContent = Math.hypot(lastABody.x, lastABody.y, lastABody.z).toFixed(2);
   $('sAccW').textContent = Math.hypot(lastAWorld.x, lastAWorld.y, lastAWorld.z).toFixed(2);
   $('sDisp').textContent = Math.hypot(pos.x, pos.y).toFixed(3);
