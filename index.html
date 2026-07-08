@@ -206,7 +206,7 @@
     <input type="checkbox" id="zuptChk" style="width:22px;height:22px;accent-color:var(--accent)">
     <span class="val" id="zuptState" style="min-width:60px">OFF</span>
   </div>
-  <div class="subtitle" style="margin:6px 0 0">三段觸發:①儀器靜止(桌面級)②鬆弛靜止(陀螺/加速度「均值」安靜——穿透引擎怠速與手抖;GPS 速度 >0.8 m/s 時否決)③GPS 零速(<0.4 m/s)。觸發後回溯扣除幻影位移 + 速度歸零 + 零偏學習。</div>
+  <div class="subtitle" style="margin:6px 0 0">兩段觸發:①儀器靜止(桌面級,室內停下拿穩即可)②鬆弛靜止(陀螺均值安靜 + GPS 確認 <0.4 m/s——穿透引擎怠速震動,GPS 確認為必要條件)。觸發後回溯扣除幻影位移 + 速度歸零 + 零偏學習。</div>
   <div class="slider-row" style="margin-top:12px">
     <label>磁力計 yaw 修正</label>
     <input type="checkbox" id="magChk" style="width:22px;height:22px;accent-color:var(--accent)">
@@ -621,10 +621,13 @@ function onMotion(ev) {
     // 運動中 → 慢 τ,且自估線性加速度大時再降 10 倍,避免持續加速度被吸進重力
     //(等效高通 → 減速時走回頭路)。水平加速度幾乎不改 |ag|,大小閘擋不住,必須靠這裡。
     let gain;
-    if (isStill || gyroQuiet) {
-      // 陀螺均值安靜就允許快速再錨定:震動下重力方向的「平均」仍可信,
-      // 且必須先修回姿態、假加速度才會消退,鬆弛 ZUPT 才進得來(避免互相等待)
-      gain = dt / 2;
+    if (isStill) {
+      gain = dt / 2;   // 快速再錨定只給儀器級靜止
+    } else if (gyroQuiet) {
+      // 陀螺均值安靜(怠速/穩定步行):只繞過運動閘的 ×0.1,以正常 τ 追「平均」重力。
+      // 不可用快速增益——步行的表觀重力「瞬時」擺動 ±20°,τ=2s 會追著擺動跑,
+      // 把姿態攪爛(公園實驗教訓:陀螺量到完整 360° 迴圈,姿態層只剩 ~0°)。
+      gain = dt / tau;
     } else {
       gain = dt / tau;
       if (Math.hypot(lastAWorld.x, lastAWorld.y, lastAWorld.z) > 0.4) gain *= 0.1;
@@ -746,30 +749,26 @@ function onMotion(ev) {
   posAlt.z += (velAlt.z + nvaz) * 0.5 * dt;
   velAlt.x = nvax; velAlt.y = nvay; velAlt.z = nvaz;
 
-  /* ===================== ZUPT 零速修正(可選,三段觸發)=====================
+  /* ===================== ZUPT 零速修正(可選,兩段觸發)=====================
      A) 儀器靜止(isStill):瞬時陀螺+|a| 都安靜——桌面等級的硬證據。
-     B) 鬆弛靜止(looseStill):陀螺「均值」安靜 + 世界加速度「均值」小,
-        穿透引擎怠速/手抖這類高頻零均值干擾;等速巡航也長這樣,
-        故 GPS 都卜勒速度 > 0.8 m/s 時行使否決權。
-     C) GPS 零速(gpsStill):速度 < 0.4 m/s 且精度佳——震動污染不了的獨立證據。
-     觸發後:回溯扣除幻影位移(A/B 有可信起點;C 無,只歸零)、速度歸零、
-     零偏 EMA 學習(B/C 用較小增益,震動下殘差較不可信)。 */
+     B) 鬆弛靜止(looseStill):陀螺「均值」安靜 且 GPS 明確確認慢速(<0.4 m/s)。
+        GPS 確認是「必要條件」而非僅否決權——公園實驗教訓:GPS speed 欄位
+        常為 null,靠「沒有否決」放行會在步行中連環誤觸發(假 ZUPT 110~312 槍)。
+        代價:室內無 GPS 時鬆弛觸發不可用,只剩儀器靜止(停下拿穩即可觸發)。
+     觸發後:回溯扣除幻影位移、速度歸零、零偏 EMA 學習(B 用較小增益)。 */
   emaAW.x += (aWorld.x - emaAW.x) * ka;
   emaAW.y += (aWorld.y - emaAW.y) * ka;
   emaAW.z += (aWorld.z - emaAW.z) * ka;
   const gpsFresh = (now - lastGpsWallT) < 3000;
-  const gpsVeto = gpsFresh && lastGpsSpeed != null && lastGpsSpeed > 0.8;
-  const looseNow = gyroQuiet && !gpsVeto
-    && Math.hypot(emaAW.x, emaAW.y, emaAW.z) < 0.4;
+  const gpsSlow = gpsFresh && lastGpsSpeed != null && lastGpsSpeed < 0.4;
+  const looseNow = gyroQuiet && gpsSlow;
   if (looseNow) { looseHold++; if (looseHold === 1) looseStartT = now; } else looseHold = 0;
   const looseStill = looseHold >= 60;   // 持續 ~1s
-  const gpsStill = gpsFresh && lastGpsSpeed != null && lastGpsSpeed < 0.4 && gpsAccuracy < 25;
 
-  if (zuptEnabled && (isStill || looseStill || gpsStill)) {
+  if (zuptEnabled && (isStill || looseStill)) {
     if (!zuptActiveNow) {
-      // 首次觸發:扣除靜止期間累積的幻影位移(視窗上限 3s 防呆),兩路都修。
-      // 觸發源優先用起點可信的:嚴格靜止 > 鬆弛靜止 > GPS(無起點,不回溯)
-      const startT = isStill ? stillStartT : (looseStill ? looseStartT : now);
+      // 首次觸發:扣除靜止期間累積的幻影位移(視窗上限 3s 防呆),兩路都修
+      const startT = isStill ? stillStartT : looseStartT;
       const dtStill = Math.min((now - startT) / 1000, 3);
       pos.x -= vel.x * dtStill;
       pos.y -= vel.y * dtStill;
