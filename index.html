@@ -290,10 +290,14 @@ $('zuptChk').addEventListener('change', e => { zuptEnabled = e.target.checked; }
 
 // 磁力計 yaw 修正開關
 let magEnabled = false;
-let magYawOffset = null;    // 鎖定「我們的 yaw + 羅盤航向」的初始偏移
+let magYawOffset = null;    // 鎖定 yaw 與 s·羅盤 的初始偏移
+let magSign = 0;            // +1/−1:yaw 與羅盤同向或反向;0=未學會
+let magCorrAcc = 0;         // 符號學習的相關量累積 Σ Δyaw·Δhdg
+let magPrev = null;
+function resetMagLearning() { magYawOffset = null; magSign = 0; magCorrAcc = 0; magPrev = null; }
 $('magChk').addEventListener('change', e => {
   magEnabled = e.target.checked;
-  if (!magEnabled) magYawOffset = null;   // 關閉即重置,下次開啟重新鎖定
+  if (!magEnabled) resetMagLearning();    // 關閉即重置,下次開啟重新學習
 });
 
 // ---- GPS 記錄(ground truth)----
@@ -594,20 +598,38 @@ function onMotion(ev) {
   }
 
   /* ---- 磁力計 yaw 修正(可選)----
-     羅盤航向順時針增、我們的 yaw(繞 +Z 逆時針)反向,故 yaw + heading ≈ 常數。
-     首次鎖定這個偏移,之後把 yaw 往 (offset − heading) 拉——只修「相對漂移」,
-     不改我們任意選定的世界系朝向,磁偏角與安裝方向都被 offset 吸收。 */
+     教訓:各平台 rotationRate 正負慣例不一(iOS 與規格相反),yaw 與羅盤的
+     旋向關係「不可假設,必須從資料學」——否則修正會跟真實旋轉打架
+     (梯廳實驗:繞一圈 360°,yaw 被反向修正凍到只剩 −9°)。
+     1) 符號學習:累積 Σ Δyaw·Δhdg,轉動幾度後正負自明。
+     2) 偏移鎖定:offset = yaw − s·heading(磁偏角/安裝角/任意世界系全吸收)。
+     3) 異常閘:|err| > 45° 時不修(磁異常、電梯機房、失鎖),寧漂勿拉歪。 */
   if (magEnabled && magHeading != null && (now - magT) < 1500) {
     const yawDeg = qToEuler(q).yaw * 180/Math.PI;
-    if (magYawOffset === null) {
-      magYawOffset = yawDeg + magHeading;
-    } else {
-      let err = (magYawOffset - magHeading) - yawDeg;   // deg
-      while (err > 180) err -= 360; while (err < -180) err += 360;
-      const g = Math.min(dt / 20, 0.05);                 // τ=20s
-      const half = err * Math.PI/180 * g / 2;
-      // 世界系繞 Z 的小旋轉,左乘
-      q = qNorm(qMul({ w: Math.cos(half), x: 0, y: 0, z: Math.sin(half) }, q));
+    if (magPrev) {
+      let dy = yawDeg - magPrev.yaw;
+      while (dy > 180) dy -= 360; while (dy < -180) dy += 360;
+      let dh = magHeading - magPrev.hdg;
+      while (dh > 180) dh -= 360; while (dh < -180) dh += 360;
+      if (magSign === 0) {
+        magCorrAcc += dy * dh;
+        if (Math.abs(magCorrAcc) > 200) magSign = magCorrAcc > 0 ? 1 : -1;  // 轉 ~15° 即可判定
+      }
+    }
+    magPrev = { yaw: yawDeg, hdg: magHeading };
+    if (magSign !== 0) {
+      if (magYawOffset === null) {
+        magYawOffset = yawDeg - magSign * magHeading;
+      } else {
+        let err = (magYawOffset + magSign * magHeading) - yawDeg;   // deg
+        while (err > 180) err -= 360; while (err < -180) err += 360;
+        if (Math.abs(err) < 45) {
+          const g = Math.min(dt / 20, 0.05);               // τ=20s
+          const half = err * Math.PI/180 * g / 2;
+          // 世界系繞 Z 的小旋轉,左乘(不影響重力方向,只轉航向)
+          q = qNorm(qMul({ w: Math.cos(half), x: 0, y: 0, z: Math.sin(half) }, q));
+        }
+      }
     }
   }
 
@@ -854,7 +876,7 @@ function resetSession() {
   log = []; traj = []; trajAlt = []; errSeries = [];
   staticBadCount = 0; sensorWarned = false;
   zuptActiveNow = false; stillHold = 0; stillStartT = 0;
-  magYawOffset = null;
+  resetMagLearning();
   lastABody = { x:0, y:0, z:0 }; lastAWorld = { x:0, y:0, z:0 };
 }
 
