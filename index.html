@@ -324,7 +324,18 @@ let gpsAccuracy = 0;
 function onGpsFix(p) {
   const { latitude: lat, longitude: lon, accuracy } = p.coords;
   gpsAccuracy = accuracy;
-  if (!gpsOrigin) gpsOrigin = { lat, lon };
+  gpsFixCount++;
+  gpsLatest = { lat, lon, accuracy, speed: p.coords.speed,
+                alt: p.coords.altitude, consumed: false };  // CSV 照記(含暖機期的爛 fix,分析用)
+  lastGpsSpeed = p.coords.speed;
+  lastGpsWallT = performance.now();
+  // ENU 原點鎖定:等精度 ≤20m 才定。
+  // 實測 iPhone 冷啟動首固定點偏 58m、前 20 秒游走 80m——用第一個 fix 當原點,
+  // 整條綠軌和閉環誤差都會被污染;寧可犧牲暖機期的軌跡。
+  if (!gpsOrigin) {
+    if (accuracy > 20) return;
+    gpsOrigin = { lat, lon };
+  }
   // 經緯度 → 局部 ENU 平面(等距圓柱近似,數公里內誤差可忽略)
   const x = (lon - gpsOrigin.lon) * Math.cos(gpsOrigin.lat * Math.PI/180) * 111320;
   const y = (lat - gpsOrigin.lat) * 110540;
@@ -335,11 +346,6 @@ function onGpsFix(p) {
   gpsErrSeries.push({ t, d: Math.hypot(x, y) });
   if (gpsTraj.length > 4000) gpsTraj.shift();
   if (gpsErrSeries.length > 4000) gpsErrSeries.shift();
-  gpsFixCount++;
-  gpsLatest = { lat, lon, accuracy, speed: p.coords.speed,
-                alt: p.coords.altitude, consumed: false };  // altitude 室外才有,可為 null
-  lastGpsSpeed = p.coords.speed;          // 都卜勒速度(可為 null)
-  lastGpsWallT = performance.now();
   // 方位對齊(單次鎖定):IMU 無磁力計,世界系 yaw 任意;
   // 等兩軌都走出 >15 m,用初期位移方向差把 GPS 轉進 IMU 系(初期 IMU 最可信)
   if (gpsAlign === null) {
