@@ -485,7 +485,9 @@ async function requestSensorPermission() {
 let magHeading = null;      // 最新羅盤航向(deg,順時針自磁北)
 let magAccuracy = null;     // iOS 提供的精度估計(deg)
 let magT = 0;
+let orientEvtSeen = false;  // 有沒有收到任何 orientation 事件(診斷用)
 function onOrient(ev) {
+  orientEvtSeen = true;
   let h = null;
   if (typeof ev.webkitCompassHeading === 'number' && ev.webkitCompassHeading >= 0) {
     h = ev.webkitCompassHeading;                 // iOS:絕對磁航向
@@ -495,8 +497,17 @@ function onOrient(ev) {
   }
   if (h != null) { magHeading = h; magT = performance.now(); }
 }
-const orientEvName = ('ondeviceorientationabsolute' in window)
-  ? 'deviceorientationabsolute' : 'deviceorientation';
+// 兩種事件都聽(部分裝置只發其中一種;handler 自行篩選 absolute)
+function attachOrient() {
+  window.addEventListener('deviceorientationabsolute', onOrient);
+  window.addEventListener('deviceorientation', onOrient);
+}
+// 不需權限的平台(Android)載入即聽,健檢羅盤不用先按校正;
+// iOS 需在權限手勢後才有資料,校正流程中會再 attach 一次(重複掛同函式無害)
+if (!(typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof DeviceOrientationEvent.requestPermission === 'function')) {
+  attachOrient();
+}
 
 // devicemotion 主回呼:所有 IMU 計算都在這裡
 function onMotion(ev) {
@@ -844,7 +855,7 @@ async function startCalibration() {
   lastEventT = 0; dtSmoothed = 0;
 
   window.addEventListener('devicemotion', onMotion);
-  window.addEventListener(orientEvName, onOrient);
+  attachOrient();
   setState(State.CALIB);
   setStatus('校正中:請將手機平放靜置,收集 5 秒零偏資料…', 'ok');
   calibCard.classList.remove('hidden');
@@ -1272,7 +1283,8 @@ function updatePanel() {
   $('zuptState').textContent = zuptEnabled ? (zuptActiveNow ? 'ON·觸發中' : 'ON') : 'OFF';
   $('ownAccState').textContent = ownAcc ? '自算' : 'OS';
   $('magState').textContent = magHeading == null
-    ? (magEnabled ? 'ON(無羅盤資料)' : 'OFF')
+    ? (orientEvtSeen ? '有事件·無航向(瀏覽器不支援)'
+                     : (magEnabled ? 'ON·' : '') + '等待感測器(先按①授權)')
     : (magEnabled ? 'ON·' : '') + magHeading.toFixed(0) + '°'
       + (magAccuracy != null ? '±' + magAccuracy.toFixed(0) : '');
   $('gpsState').textContent = !gpsEnabled ? 'OFF'
