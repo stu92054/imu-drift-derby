@@ -227,6 +227,12 @@
   </div>
   <div class="subtitle" style="margin:6px 0 0">用 OS 羅盤航向錨定 yaw 漂移(τ=20s,鎖定初始偏移後只修相對漂移)。注意:機車引擎/鋼橋/市區鋼筋會污染磁場——室內與步行實驗適用,車載實驗建議關閉對照。</div>
   <div class="slider-row" style="margin-top:12px">
+    <label>GPS 航向修正</label>
+    <input type="checkbox" id="gpsHdgChk" style="width:22px;height:22px;accent-color:var(--accent)">
+    <span class="val" id="gpsHdgState" style="min-width:100px">OFF</span>
+  </div>
+  <div class="subtitle" style="margin:6px 0 0">用 GPS 航跡向(都卜勒,對真北)錨定 yaw 與速率DR 航向——免疫磁干擾的「第二顆羅盤」,精度 ±1~2°。僅速度 >1.5 m/s 時有效,靜止/室內自動失效。載具實驗建議開啟(高鐵/機車可取代磁力計)。</div>
+  <div class="slider-row" style="margin-top:12px">
     <label>GPS 記錄</label>
     <input type="checkbox" id="gpsChk" checked style="width:22px;height:22px;accent-color:var(--accent)">
     <span class="val" id="gpsState" style="min-width:100px">ON</span>
@@ -339,6 +345,17 @@ $('magChk').addEventListener('change', e => {
   if (!magEnabled) resetMagLearning();    // 關閉即重置,下次開啟重新學習
 });
 
+// GPS 航跡向修正(免疫磁干擾的「第二顆羅盤」)
+let gpsHdgEnabled = false;
+let lastGpsCourse = null, lastGpsCourseT = 0;   // 航跡向(deg,順時針自真北)
+let ghSign = 0, ghCorrAcc = 0, ghPrev = null, ghOffset = null;  // yaw 修正:符號學習+偏移鎖定
+let drCrsOffset = null;                          // DR 航向 vs course 的偏移鎖定
+function resetGpsHdg() { ghSign = 0; ghCorrAcc = 0; ghPrev = null; ghOffset = null; drCrsOffset = null; }
+$('gpsHdgChk').addEventListener('change', e => {
+  gpsHdgEnabled = e.target.checked;
+  if (!gpsHdgEnabled) resetGpsHdg();
+});
+
 // ---- GPS 記錄(ground truth)----
 let gpsEnabled = true;
 $('gpsChk').addEventListener('change', e => { gpsEnabled = e.target.checked; });
@@ -357,9 +374,16 @@ function onGpsFix(p) {
   gpsAccuracy = accuracy;
   gpsFixCount++;
   gpsLatest = { lat, lon, accuracy, speed: p.coords.speed,
-                alt: p.coords.altitude, consumed: false };  // CSV 照記(含暖機期的爛 fix,分析用)
+                alt: p.coords.altitude, course: p.coords.heading,
+                consumed: false };  // CSV 照記(含暖機期的爛 fix,分析用)
   lastGpsSpeed = p.coords.speed;
   lastGpsWallT = performance.now();
+  // 航跡向只在有速度時有定義(低速時是純噪聲)
+  if (p.coords.heading != null && !isNaN(p.coords.heading) &&
+      p.coords.speed != null && p.coords.speed > 1.5) {
+    lastGpsCourse = p.coords.heading;
+    lastGpsCourseT = performance.now();
+  }
   // ENU 原點鎖定:等精度 ≤20m 才定。
   // 實測 iPhone 冷啟動首固定點偏 58m、前 20 秒游走 80m——用第一個 fix 當原點,
   // 整條綠軌和閉環誤差都會被污染;寧可犧牲暖機期的軌跡。
@@ -729,6 +753,37 @@ function onMotion(ev) {
     }
   }
 
+  /* ---- GPS 航跡向 yaw 修正(可選)----
+     course 對真北、免疫磁干擾;與 yaw 的旋向關係同樣「從資料學」(鏡射磁力計做法)。
+     偏移鎖定吸收手機安裝角與世界系任意朝向;45° 異常閘防低品質 course 亂拉。 */
+  if (gpsHdgEnabled && lastGpsCourse != null && (now - lastGpsCourseT) < 3000) {
+    const yawDeg2 = qToEuler(q).yaw * 180/Math.PI;
+    if (ghPrev) {
+      let dy = yawDeg2 - ghPrev.yaw;
+      while (dy > 180) dy -= 360; while (dy < -180) dy += 360;
+      let dc = lastGpsCourse - ghPrev.crs;
+      while (dc > 180) dc -= 360; while (dc < -180) dc += 360;
+      if (ghSign === 0) {
+        ghCorrAcc += dy * dc;
+        if (Math.abs(ghCorrAcc) > 200) ghSign = ghCorrAcc > 0 ? 1 : -1;
+      }
+    }
+    ghPrev = { yaw: yawDeg2, crs: lastGpsCourse };
+    if (ghSign !== 0) {
+      if (ghOffset === null) {
+        ghOffset = yawDeg2 - ghSign * lastGpsCourse;
+      } else {
+        let err = (ghOffset + ghSign * lastGpsCourse) - yawDeg2;
+        while (err > 180) err -= 360; while (err < -180) err += 360;
+        if (Math.abs(err) < 45) {
+          const g = Math.min(dt / 10, 0.05);   // τ=10s(course 品質優於磁羅盤)
+          const half = err * Math.PI/180 * g / 2;
+          q = qNorm(qMul({ w: Math.cos(half), x: 0, y: 0, z: Math.sin(half) }, q));
+        }
+      }
+    }
+  }
+
   att = qToEuler(q);
 
   /* ===================== 慣性導航二次積分 =====================
@@ -789,6 +844,18 @@ function onMotion(ev) {
     }
   } else {
     hdgDr += wWorldZ * dt;
+    // GPS 航跡向直接錨定 DR 航向(τ=10s)。
+    // s=−1 是數學必然(非平台慣例):course 順時針增、hdgDr(math 角)逆時針增。
+    if (gpsHdgEnabled && lastGpsCourse != null && (now - lastGpsCourseT) < 3000) {
+      const crsRad = lastGpsCourse * Math.PI/180;
+      if (drCrsOffset === null) {
+        drCrsOffset = hdgDr + crsRad;
+      } else {
+        let e = (drCrsOffset - crsRad) - hdgDr;
+        while (e > Math.PI) e -= 2*Math.PI; while (e < -Math.PI) e += 2*Math.PI;
+        if (Math.abs(e) < Math.PI/4) hdgDr += e * Math.min(dt / 10, 0.05);
+      }
+    }
     // GPS 斷訊(隧道)→ 維持最後已知速度惰行(coast)。
     // 真輪速計會持續量測;對火車/高鐵,速度短時間近似不變,惰行是合理模型。
     // 注意:惰行期間的減速/加速不會被反映——這是「模擬」輪速計的誠實極限。
@@ -878,8 +945,9 @@ function onMotion(ev) {
          [gpsLatest.lat.toFixed(7), gpsLatest.lon.toFixed(7),
           gpsLatest.accuracy.toFixed(1),
           gpsLatest.speed != null ? gpsLatest.speed.toFixed(2) : '',
-          gpsLatest.alt != null ? gpsLatest.alt.toFixed(1) : ''])
-      : ['', '', '', '', ''])
+          gpsLatest.alt != null ? gpsLatest.alt.toFixed(1) : '',
+          (gpsLatest.course != null && !isNaN(gpsLatest.course)) ? gpsLatest.course.toFixed(1) : ''])
+      : ['', '', '', '', '', ''])
   ]);
 
   // --- 軌跡 / 誤差序列(降採樣以免爆記憶體)---
@@ -1015,7 +1083,9 @@ function resetSession() {
   emaG = { x:0, y:0, z:0 }; emaAW = { x:0, y:0, z:0 };
   gyroQuietHold = 0; looseHold = 0; looseStartT = 0;
   lastGpsSpeed = null; lastGpsWallT = 0;
+  lastGpsCourse = null; lastGpsCourseT = 0;
   resetMagLearning();
+  resetGpsHdg();
   lastABody = { x:0, y:0, z:0 }; lastAWorld = { x:0, y:0, z:0 };
 }
 
@@ -1067,7 +1137,7 @@ function buildCSV() {
     'px_alt','py_alt','pz_alt',
     'px_dr','py_dr',
     'mag_hdg_deg',
-    'gps_lat','gps_lon','gps_acc_m','gps_speed','gps_alt_m'
+    'gps_lat','gps_lon','gps_acc_m','gps_speed','gps_alt_m','gps_course_deg'
   ].join(',');
   const body = log.map(r => r.join(',')).join('\n');
   // 檔頭附上 metadata 註解(以 # 開頭,分析時可略過)
@@ -1085,6 +1155,7 @@ function buildCSV() {
     `# mean_hz=${dtSmoothed ? (1/dtSmoothed).toFixed(1) : 'NA'}`,
     `# jerk_events=${jerkCount}`,
     `# mag_correction=${magEnabled ? 'on' : 'off'}`,
+    `# gps_hdg_correction=${gpsHdgEnabled ? 'on' : 'off'}`,
     `# gps_fixes=${gpsFixCount}`,
     `# gps_origin=${gpsOrigin ? gpsOrigin.lat.toFixed(7) + ',' + gpsOrigin.lon.toFixed(7) : 'NA'}`,
     `# gps_net_m=${gpsLastPt ? Math.hypot(gpsLastPt.x, gpsLastPt.y).toFixed(1) : 'NA'}`,
@@ -1368,6 +1439,10 @@ function updatePanel() {
                      : (magEnabled ? 'ON·' : '') + '等待感測器(先按①授權)')
     : (magEnabled ? 'ON·' : '') + magHeading.toFixed(0) + '°'
       + (magAccuracy != null ? '±' + magAccuracy.toFixed(0) : '');
+  $('gpsHdgState').textContent = !gpsHdgEnabled ? 'OFF'
+    : (lastGpsCourse != null && (performance.now() - lastGpsCourseT) < 3000)
+      ? 'ON·' + lastGpsCourse.toFixed(0) + '°'
+      : 'ON(待速度 >1.5)';
   $('gpsState').textContent = !gpsEnabled ? 'OFF'
     : gpsWatchId === null ? 'ON(待命)'
     : gpsFixCount === 0 ? 'ON(搜星中…)'
