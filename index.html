@@ -955,7 +955,12 @@ function onMotion(ev) {
   if (looseNow) { looseHold++; if (looseHold === 1) looseStartT = now; } else looseHold = 0;
   const looseStill = looseHold >= 60;   // 持續 ~1s
 
-  if (zuptEnabled && (isStill || looseStill)) {
+  // 高鐵教訓:295 km/h 巡航平順到通過「儀器級靜止」判定(jerk=0)——
+  // 伽利略相對性:等速運動局部不可觀測,IMU 單獨無法分辨巡航與靜止。
+  // 防護:最後已知 GPS 速度高、且其後無新 GPS 確認減速 → 不信任靜止判定。
+  const cruiseSuspect = lastGpsSpeed != null && lastGpsSpeed > 5 &&
+                        (now - lastGpsWallT) > 3000 && (now - lastGpsWallT) < 300000;
+  if (zuptEnabled && (isStill || looseStill) && !cruiseSuspect) {
     if (!zuptActiveNow) {
       // 首次觸發:扣除靜止期間累積的幻影位移(視窗上限 3s 防呆),兩路都修
       const startT = isStill ? stillStartT : looseStartT;
