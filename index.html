@@ -144,7 +144,7 @@
   <div class="grid">
     <div class="stat"><div class="k">經過時間</div><div class="v"><span id="sElapsed">0.0</span><span class="u"> s</span></div></div>
     <div class="stat"><div class="k">水平位移</div><div class="v"><span id="sDisp">0.000</span><span class="u"> m</span></div></div>
-    <div class="stat"><div class="k">速度大小</div><div class="v"><span id="sSpeed">0.000</span><span class="u"> m/s</span></div></div>
+    <div class="stat"><div class="k">速度大小</div><div class="v"><span id="sSpeed">0.000</span><span class="u" id="sSpeedU"> m/s</span></div></div>
     <div class="stat"><div class="k">另一來源位移</div><div class="v" style="color:var(--accent-2)"><span id="sDispAlt">0.000</span><span class="u"> m</span></div></div>
     <div class="stat"><div class="k">GPS 位移(真值)</div><div class="v" style="color:var(--ok)"><span id="sGps">--</span><span class="u"> m</span></div></div>
     <div class="stat"><div class="k">IMU/GPS 誤差比</div><div class="v"><span id="sErrRatio">--</span></div></div>
@@ -1532,7 +1532,11 @@ function updatePanel() {
   $('sAccW').textContent = Math.hypot(lastAWorld.x, lastAWorld.y, lastAWorld.z).toFixed(2);
   $('sDisp').textContent = Math.hypot(pos.x, pos.y).toFixed(3);
   $('sDispAlt').textContent = Math.hypot(posAlt.x, posAlt.y).toFixed(3);
-  $('sSpeed').textContent = Math.hypot(vel.x, vel.y, vel.z).toFixed(3);
+  // 超過跑步速度改顯示 km/h(4.5 上切 / 3.5 下切,遲滯防閃爍)
+  const spd = Math.hypot(vel.x, vel.y, vel.z);
+  if (spd > 4.5) speedKmh = true; else if (spd < 3.5) speedKmh = false;
+  $('sSpeed').textContent = speedKmh ? (spd * 3.6).toFixed(1) : spd.toFixed(3);
+  $('sSpeedU').textContent = speedKmh ? ' km/h' : ' m/s';
   $('sRoll').textContent  = (att.roll*180/Math.PI).toFixed(1);
   $('sPitch').textContent = (att.pitch*180/Math.PI).toFixed(1);
   $('sYaw').textContent   = (att.yaw*180/Math.PI).toFixed(1);
@@ -1589,6 +1593,7 @@ function setState(s) {
   btnShare.disabled = btnExport.disabled;
 }
 
+let speedKmh = false;   // 速度顯示單位狀態(遲滯切換)
 let baseStatus = '';
 function setStatus(msg, kind) {
   baseStatus = msg;
