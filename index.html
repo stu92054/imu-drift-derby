@@ -344,7 +344,8 @@ let magYawOffset = null;    // 鎖定 yaw 與 s·羅盤 的初始偏移
 let magSign = loadSign('magSign');   // +1/−1:yaw 與羅盤同向或反向;0=未學會
 let magCorrAcc = 0;         // 符號學習的相關量累積 Σ Δyaw·Δhdg
 let magPrev = null;
-function resetMagLearning() { magYawOffset = null; magSign = loadSign('magSign'); magCorrAcc = 0; magPrev = null; }
+let magGateSnap = null;     // 閘門啟動瞬間的 (yaw, 羅盤) 快照——區分磁事件 vs 換姿勢用
+function resetMagLearning() { magYawOffset = null; magSign = loadSign('magSign'); magCorrAcc = 0; magPrev = null; magGateSnap = null; }
 $('magChk').addEventListener('change', e => {
   magEnabled = e.target.checked;
   if (!magEnabled) resetMagLearning();    // 關閉即重置,下次開啟重新學習
@@ -473,6 +474,8 @@ let hdgRawDr = 0;              // 未定符號的原始積分(符號學習用)
 let vOdoHold = 0;              // 最後已知 GPS 速度(斷訊時惰行用)
 let upLP = { x:0, y:0, z:0 };  // body 系「上」= 加速計低通。DR 航向率 = ω·upLP,
                                // 繞過姿態管線——傾角估計錯誤不會把旋轉投丟(公園實測教訓)
+let wUpBias = 0;               // wUp 零偏(ZART-lite:course 直線段=零轉率參考,線上學習)
+let crsStable = false;         // 目前 course 是否處於直線段(學習閘)
 let att = { roll:0, pitch:0, yaw:0 };
 let lastABody = { x:0, y:0, z:0 };   // 最新扣零偏後 body 加速度(診斷顯示用)
 let lastAWorld = { x:0, y:0, z:0 };  // 最新世界系加速度(診斷顯示用)
@@ -738,7 +741,8 @@ function onMotion(ev) {
      1) 符號學習:累積 Σ Δyaw·Δhdg,轉動幾度後正負自明。
      2) 偏移鎖定:offset = yaw − s·heading(磁偏角/安裝角/任意世界系全吸收)。
      3) 異常閘:|err| > 45° 時不修(磁異常、電梯機房、失鎖),寧漂勿拉歪。 */
-  if (magEnabled && magHeading != null && (now - magT) < 1500) {
+  if (magEnabled && magHeading != null && (now - magT) < 1500 &&
+      !(magAccuracy != null && magAccuracy > 30)) {   // iOS 自報精度差 → 羅盤閉嘴(|B|測謊的網頁代理)
     const yawDeg = qToEuler(q).yaw * 180/Math.PI;
     if (magPrev) {
       let dy = yawDeg - magPrev.yaw;
@@ -767,11 +771,28 @@ function onMotion(ev) {
           const half = err * Math.PI/180 * g / 2;
           // 世界系繞 Z 的小旋轉,左乘(不影響重力方向,只轉航向)
           q = qNorm(qMul({ w: Math.cos(half), x: 0, y: 0, z: Math.sin(half) }, q));
-          magGateT = 0;
+          magGateT = 0; magGateSnap = null;
         } else {
-          // 重捕獲:被閘在外連續 3s → 重新鎖定偏移(有閘門就必須有重捕獲)
-          if (!magGateT) magGateT = now;
-          else if (now - magGateT > 3000) { magYawOffset = null; magGateT = 0; }
+          // 重捕獲(飛行教訓版):先問陀螺這段時間有沒有真的旋轉——
+          // 有(換手/換座)→ 姿勢改變,重鎖偏移;沒有(餐車/MagSafe 靠近)→ 磁事件,
+          // 繼續封鎖羅盤。無腦重鎖會把污染值鎖進偏移(BR190 餐間 300 km 的教訓)。
+          if (!magGateT) {
+            magGateT = now;
+            magGateSnap = { yaw: yawDeg, h: magHeading };
+          } else if (now - magGateT > 3000) {
+            let dYaw = yawDeg - magGateSnap.yaw;
+            while (dYaw > 180) dYaw -= 360; while (dYaw < -180) dYaw += 360;
+            let dMag = magHeading - magGateSnap.h;
+            while (dMag > 180) dMag -= 360; while (dMag < -180) dMag += 360;
+            let inc = dMag - magSign * dYaw;
+            while (inc > 180) inc -= 360; while (inc < -180) inc += 360;
+            if (Math.abs(inc) < 25) {
+              magYawOffset = null; magGateT = 0; magGateSnap = null;   // 姿勢改變:重鎖
+            } else {
+              magGateT = now;                                          // 磁事件:延長封鎖
+              magGateSnap = { yaw: yawDeg, h: magHeading };
+            }
+          }
         }
       }
     }
@@ -884,9 +905,14 @@ function onMotion(ev) {
     }
   }
   const unLP = Math.hypot(upLP.x, upLP.y, upLP.z) || 1;
-  const wUp = (wx*upLP.x + wy*upLP.y + wz*upLP.z) / unLP;   // rad/s,符號=瀏覽器慣例(由學習吸收)
+  const wUpRaw = (wx*upLP.x + wy*upLP.y + wz*upLP.z) / unLP;  // rad/s,符號=瀏覽器慣例(由學習吸收)
+  // ZART-lite:course 直線段(零轉率參考)時,以 τ≈30s 學習 wUp 零偏——
+  // 飛行實測:零偏修正一項就讓純陀螺推算 1247→384 km,隧道惰行直接受益
+  if (crsStable) wUpBias += (wUpRaw - wUpBias) * Math.min(dt / 30, 0.05);
+  const wUp = wUpRaw - wUpBias;
   hdgRawDr += wUp * dt;
   const crsFresh = lastGpsCourse != null && (now - lastGpsCourseT) < 3000;
+  if (!crsFresh) crsStable = false;   // 斷訊:停止學習(保留已學零偏供惰行使用)
   const crsMath = crsFresh ? (90 - lastGpsCourse) * Math.PI/180 : null;  // 課程→北朝上 math 角
   // 符號學習:每個新 fix 取樣一次(逐樣本會稀釋相關量——重播實測教訓)
   if (crsFresh && (!drCrsPrev || drCrsPrev.ct !== lastGpsCourseT)) {
@@ -894,6 +920,8 @@ function onMotion(ev) {
       const dH = hdgRawDr - drCrsPrev.h;
       let dC = crsMath - drCrsPrev.c;
       while (dC > Math.PI) dC -= 2*Math.PI; while (dC < -Math.PI) dC += 2*Math.PI;
+      // 直線段判定(零偏學習閘):course 變化小且有速度
+      crsStable = Math.abs(dC) < 3*Math.PI/180 && lastGpsSpeed != null && lastGpsSpeed > 3;
       drCrsCorr += dH * dC;
       if (drCrsSign === 0 && Math.abs(drCrsCorr) > 0.06) {
         drCrsSign = drCrsCorr > 0 ? 1 : -1;
@@ -1108,6 +1136,7 @@ function startRun() {
   posAlt = { x:0, y:0, z:0 };
   velAlt = { x:0, y:0, z:0 };
   posDr = { x:0, y:0 }; hdgDr = null; hdgRawDr = 0; vOdoHold = 0; upLP = { x:0, y:0, z:0 };
+  wUpBias = 0; crsStable = false;
   log = []; traj = [{x:0,y:0}]; trajAlt = [{x:0,y:0}]; trajDr = [{x:0,y:0}]; errSeries = []; peakDisp = 0;
   staticBadCount = 0; sensorWarned = false;
   jerkCount = 0; lastAgMagJ = null;
@@ -1147,6 +1176,7 @@ function resetSession() {
   posAlt = { x:0, y:0, z:0 };
   velAlt = { x:0, y:0, z:0 };
   posDr = { x:0, y:0 }; hdgDr = null; hdgRawDr = 0; vOdoHold = 0; upLP = { x:0, y:0, z:0 };
+  wUpBias = 0; crsStable = false;
   elapsed = 0; peakDisp = 0;
   log = []; traj = []; trajAlt = []; trajDr = []; errSeries = [];
   staticBadCount = 0; sensorWarned = false;
